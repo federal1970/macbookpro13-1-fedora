@@ -110,36 +110,43 @@ cat /sys/power/mem_sleep      # expected: [s2idle] deep
 **Result:** instant wake, USB and Wi-Fi alive afterwards. Verified over 30-second
 and 90-second suspends.
 
-### Thunderbolt is *not* the problem
+### Thunderbolt is *not* the cause
 
 Issue #207 recommends disabling Thunderbolt because of 2–3 minute resume delays.
-That turned out to be a red herring here: after loading the module again
-(`sudo modprobe thunderbolt`) wake stayed instant. The fix was the **sleep mode**,
-not Thunderbolt. Thunderbolt is left enabled and the ports keep working.
+That turned out to be a red herring here: with the sleep-mode fix above in place,
+wake is instant whether or not the `thunderbolt` module is loaded. The fix is the
+**sleep mode**, not Thunderbolt.
 
-If you do need to disable it, note this trap — a blacklist file **does not work**,
-because udev loads the module by alias anyway:
+### Disabling Thunderbolt anyway
+
+Two ways, both working. A blacklist file:
 
 ```bash
-# this does NOT work
 sudo sh -c 'echo "blacklist thunderbolt" > /etc/modprobe.d/disable-thunderbolt.conf'
+sudo dracut -f
+sudo rmmod thunderbolt        # unload now, without rebooting
+lsmod | grep thunderbolt      # verify: no output
 ```
 
-Only a kernel parameter works, because it takes effect before udev:
+> **`sudo dracut -f` is the step that matters.** `thunderbolt` is loaded early out
+> of the initramfs, so a blacklist file on its own changes nothing until the
+> initramfs is rebuilt to include it. Skip `dracut -f` and the blacklist looks
+> broken — the module simply loads again on the next boot.
+
+Or a kernel parameter, which the kernel applies before any module loading and so
+needs no initramfs rebuild of its own:
 
 ```bash
 sudo grubby --update-kernel=ALL --args="module_blacklist=thunderbolt"
-sudo dracut -f
-sudo rmmod thunderbolt        # unload now, without rebooting
-lsmod | grep thunderbolt      # verify
+sudo rmmod thunderbolt
 ```
 
-Undoing it:
+Undoing the blacklist file:
 
 ```bash
 sudo rm /etc/modprobe.d/disable-thunderbolt.conf
 sudo dracut -f
-sudo modprobe thunderbolt
+sudo modprobe thunderbolt     # bring it back without rebooting
 ```
 
 Be aware that the `thunderbolt` module drives Thunderbolt devices on the USB-C
