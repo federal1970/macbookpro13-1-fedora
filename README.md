@@ -831,10 +831,23 @@ itself as `Nov 26 2015 ... version 7.35.180.133`; WPA3 was ratified in 2018.
 Protected management frames *are* supported (`CMAC` appears among the ciphers),
 so that side is fine.
 
-Untried, and noted only because macOS proves the hardware is capable: Apple ships
-a far newer firmware for this chip than `linux-firmware` carries, and `brcmfmac`
-gains SAE when the firmware advertises it. Extracting the macOS blob is the
-obvious thing to attempt if WPA3 is ever actually needed here.
+**Extracting the macOS firmware does not help — checked, 2026-09-20.** The idea
+was obvious and wrong: macOS drives this chip with **7.35.180.119**, which is a
+revision *older* than the 7.35.180.133 already loaded here. The assumption that
+Apple ships something newer comes from T2 Macs, where `linux-firmware` carries
+nothing at all; it does not transfer to a chip that is supported upstream.
+
+The gap is in the driver, not the blob. `brcmfmac` does WPA3 through the
+firmware's `sae_ext` feature — the firmware advertises SAE, and the driver then
+hands authentication to `wpa_supplicant`. That was implemented for BCM4345 and
+BCM43455, the Raspberry Pi parts. No firmware available for BCM4350 advertises
+it.
+
+And macOS does SAE **in the host**. The same firmware cannot even offload the
+WPA2 four-way handshake, yet WPA2 works perfectly here, because `brcmfmac` runs
+that handshake itself in `wpa_supplicant`. Apple's driver handles SAE the same
+way; that path simply has not been written in `brcmfmac` for this chip. Closing
+the gap means a kernel patch, not a file swap.
 
 The arrangement here is a separate WPA2 SSID on the same router, set up
 deliberately for this machine. It associates instantly and needs nothing
@@ -929,7 +942,9 @@ Forked so the patches stay available regardless of upstream merge timing.
    `brcmfmac` with the stock firmware has no WPA3 — see
    [above](#no-wpa3-under-linux--macos-does-it-on-the-same-hardware). A separate
    WPA2 SSID on the same router serves this machine. macOS manages WPA3 on the
-   same hardware, so newer firmware may be all it would take; not attempted.
+   same hardware, but not through newer firmware — its blob is a revision older
+   than the one Linux loads. It does SAE in the host, and `brcmfmac` has no host
+   SAE path for this chip. A driver patch, not a firmware swap.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
    measuring with the module unloaded.
