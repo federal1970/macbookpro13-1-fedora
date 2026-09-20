@@ -263,10 +263,15 @@ kernel's ring buffer. Three checks that do work, cheapest first:
   `power_cycles` +1 means the drive lost power, and `unsafe_shutdowns` unchanged
   means it lost it cleanly. Those live on the controller, so nothing the kernel
   does to its own memory can roll them back.
-- **The trackpad.** Force Touch has no mechanical click, so a trackpad that still
-  clicks proves the board has power — but only if you try it during the window
-  when the machine is supposed to be off, which is easy to get wrong: the write
-  itself takes a minute with the screen already dark.
+- **The case temperature.** A machine drawing 3.8 W in `s2idle` stays warm; one
+  that has hibernated goes cold within a few minutes. Crude, but it has never
+  misled, unlike the trackpad below.
+
+Do **not** use the trackpad. Earlier revisions of this file claimed that Force
+Touch has no mechanical click, so a trackpad that still clicks proves the board
+has power. On this machine it clicks anyway, and it did so during two cycles that
+the passphrase prompt and the NVMe counters both confirmed as real power-off
+hibernations. It cost two test runs before that was noticed.
 
 Resume on top of LUKS works: the initramfs decrypts the volume before restoring
 the image, so the passphrase is asked for at power-on as usual.
@@ -949,10 +954,10 @@ Forked so the patches stay available regardless of upstream merge timing.
    and keeps its baseline on disk, so the answer survives even a run that has to be
    ended with a hard reset.
 
-   On this hardware there is also a free physical check, with one catch: the Force
-   Touch trackpad has no mechanical click, so a trackpad that still clicks means
-   the board has power. The catch is timing — the write takes about a minute with
-   the screen already dark, so a click during *that* proves nothing.
+   The free physical check that does work is temperature: `s2idle` holds the case
+   warm at 3.8 W, a hibernated machine is cold to the touch within minutes. The
+   trackpad is **not** such a check, whatever earlier revisions of this file said
+   — see the hibernation chapter.
 
 ---
 
