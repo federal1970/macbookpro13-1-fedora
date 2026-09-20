@@ -379,11 +379,12 @@ and `sync` — the snippet is in [open issues](#open-issues).
 >               <- journal ends here
 > ```
 >
-> That race is real and worth avoiding. It was also blamed, wrongly, for the
-> missing hibernation image: the image is not written on this machine whether the
-> hook runs, misfires or is absent entirely, so `PM: Image not found (code -22)`
-> on the next boot has a different cause. Either way it is not `resume_offset`,
-> where nothing is wrong.
+> That race is what stood between s2idle and hibernation, and fixing it is what
+> made the whole arrangement work. The `PM: Image not found (code -22)` seen on
+> 2026-09-20 came from the other form of the same fault — the hook sitting in
+> `/etc/systemd/system-sleep/`, where it is silently never executed, so nothing
+> unloaded the module at all. It was never `resume_offset`, where nothing is
+> wrong.
 
 If this ever stops being enough, the next step is to power down the PCIe device
 itself via `remove` in sysfs before hibernating and `rescan` after.
