@@ -23,13 +23,14 @@ MODE=${1:-shutdown}
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
-smart_field() {
-  nvme smart-log "$NVME" 2>/dev/null | awk -F: -v f="$1" '$0 ~ f {gsub(/[^0-9]/,"",$2); print $2; exit}'
-}
+# One smart-log call, all three fields parsed from it. Three separate calls
+# sometimes came back empty for the third.
 snapshot_counters() {
-  echo "PC=$(smart_field power_cycles)"
-  echo "US=$(smart_field unsafe_shutdowns)"
-  echo "DU=$(smart_field data_units_written)"
+  nvme smart-log "$NVME" 2>/dev/null | awk -F: '
+    /power_cycles/       { gsub(/[^0-9]/,"",$2); pc=$2 }
+    /unsafe_shutdowns/   { gsub(/[^0-9]/,"",$2); us=$2 }
+    /data_units_written/ { gsub(/[^0-9]/,"",$2); du=$2 }
+    END { printf "PC=%s\nUS=%s\nDU=%s\n", pc, us, du }'
 }
 say() { echo "$@" | tee -a "$REPORT"; sync; }
 
@@ -41,8 +42,12 @@ if [ "$MODE" = "--compare" ]; then
   echo "=== against the baseline of $WHEN (mode was $BASE_MODE) ==="
   printf 'power cycles     : %s -> %s\n' "$PC" "$NOW_PC"
   printf 'unsafe shutdowns : %s -> %s\n' "$US" "$NOW_US"
-  printf 'data units       : %s -> %s  (%s MB)\n' "$DU" "$NOW_DU" \
-    "$(awk -v d="$((NOW_DU - DU))" -v u="$UNIT_BYTES" 'BEGIN{printf "%.1f", d*u/1048576}')"
+  if [ -n "${DU:-}" ] && [ -n "${NOW_DU:-}" ]; then
+    printf 'data units       : %s -> %s  (%s MB)\n' "$DU" "$NOW_DU" \
+      "$(awk -v d="$((NOW_DU - DU))" -v u="$UNIT_BYTES" 'BEGIN{printf "%.1f", d*u/1048576}')"
+  else
+    echo "data units       : not recorded"
+  fi
   echo
   if [ "$NOW_PC" -gt "$PC" ]; then
     echo "VERDICT: the SSD lost power. This was a real hibernation, not a test_resume."
@@ -64,10 +69,20 @@ say
 
 grep -q '\[none\]' /sys/power/pm_test || echo none > /sys/power/pm_test
 grep -q '\[none\]' /sys/power/pm_test || { echo "pm_test is not none, refusing" >&2; exit 1; }
+# systemd-sleep writes its own HibernateMode= to /sys/power/disk just before
+# hibernating, so writing the mode here is not enough -- it gets overwritten.
+# The 2026-09-20 15:50 run asked for 'shutdown' and still went through ACPI S4.
+DROPIN=/etc/systemd/sleep.conf.d/99-hibernate-mode.conf
 echo "$MODE" > /sys/power/disk
 grep -q "\[$MODE\]" /sys/power/disk || { echo "could not select '$MODE', refusing" >&2; exit 1; }
+mkdir -p "$(dirname "$DROPIN")"
+printf '[Sleep]\nHibernateMode=%s\n' "$MODE" > "$DROPIN"
+systemctl daemon-reload 2>/dev/null
+CONF_MODE=$(systemd-analyze cat-config systemd/sleep.conf 2>/dev/null | awk -F= '/^HibernateMode=/ {m=$2} END {print m}')
+[ "$CONF_MODE" = "$MODE" ] || echo "WARNING: systemd HibernateMode is '$CONF_MODE', not '$MODE'"
 
 say "pm_test : $(cat /sys/power/pm_test)"
+say "systemd HibernateMode : ${CONF_MODE:-unknown}  (drop-in $DROPIN)"
 say "disk    : $(cat /sys/power/disk)"
 say "resume  : $(cat /sys/power/resume) offset $(cat /sys/power/resume_offset)"
 say

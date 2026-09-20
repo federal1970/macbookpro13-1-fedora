@@ -32,7 +32,7 @@ section.
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
 | **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
-| **Hibernation** | **Does not work** | [Set up as documented](#hibernation--the-intended-solution), but the kernel never writes the image — see [open issues](#open-issues) |
+| **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
@@ -55,10 +55,9 @@ backlight, NVMe storage, battery reporting, and USB-C.
 
 Suspend itself works — wake is instant and everything comes back. The problem is
 power: `s2idle` on this machine drains the battery at roughly the rate of a running
-system. The intended arrangement is **suspend-then-hibernate**: s2idle for short
-breaks, hibernation after 15 minutes. The suspend half works. The hibernate half
-does not: the machine has never once written an image — see
-[open issues](#open-issues).
+system. The arrangement that solves it is **suspend-then-hibernate**: s2idle for short
+breaks, hibernation after 15 minutes. Both halves work — the hibernate half took
+a while to believe, for reasons kept in [open issues](#open-issues).
 
 The suspend part is based on
 [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
@@ -201,10 +200,10 @@ These are exactly the symptoms that make issue #207 recommend `s2idle`.
 
 ### Hibernation — the intended solution
 
-> **This does not work yet.** Everything below is set up on the machine and each
-> piece checks out on its own, but the kernel never gets as far as writing the
-> image, so nothing is ever restored. Read it as the configuration, not as a
-> working recipe. The [open issues](#open-issues) have the current state.
+> **This works.** A full cycle was confirmed on 2026-09-20: about 894 MB written,
+> power cut, the passphrase asked for at the next power-on, and the session
+> restored. Earlier revisions of this file said the opposite; how that mistake was
+> made, and how to avoid repeating it, is in [open issues](#open-issues).
 
 S4 is advertised by the firmware. The disk here is btrfs on LUKS with 213 GB free,
 and swap is zram only, which cannot be hibernated to.
@@ -250,15 +249,27 @@ cat /proc/cmdline
 sudo systemctl hibernate
 ```
 
-**A machine that comes back is not a success.** If it returns to the same desktop
-without a reboot, it never hibernated — the journal will show
-`PM: hibernation: hibernation exit` in the *same* boot and no image write. A real
-run writes for several seconds, powers off completely, and the next boot continues
-the same boot id. On this machine only the first of those has ever been observed.
+**Telling a real hibernation from a dry run is harder than it looks.** A
+successful resume continues the *same* boot id and ends with
+`PM: hibernation: hibernation exit`, and so does a `pm_test` or `disk=test_resume`
+rehearsal that never cuts power — the restored image prints the same lines either
+way, because everything the write and the reload printed is rolled back with the
+kernel's ring buffer. Three checks that do work, cheapest first:
 
-Resume on top of LUKS is expected to work once the write does: the initramfs
-decrypts the volume before restoring the image, so the passphrase is asked for at
-power-on as usual. Untested — nothing has been restored yet.
+- **The passphrase.** With the image in a swap file inside LUKS and no keyfile or
+  TPM, a genuine resume *cannot* happen without the initramfs asking for the disk
+  password. If it did not ask, the machine never powered off.
+- **The SSD's own counters.** `sudo nvme smart-log /dev/nvme0` before and after:
+  `power_cycles` +1 means the drive lost power, and `unsafe_shutdowns` unchanged
+  means it lost it cleanly. Those live on the controller, so nothing the kernel
+  does to its own memory can roll them back.
+- **The trackpad.** Force Touch has no mechanical click, so a trackpad that still
+  clicks proves the board has power — but only if you try it during the window
+  when the machine is supposed to be off, which is easy to get wrong: the write
+  itself takes a minute with the screen already dark.
+
+Resume on top of LUKS works: the initramfs decrypts the volume before restoring
+the image, so the passphrase is asked for at power-on as usual.
 
 **The offset belongs to that one file.** Recreate the swap file and you have to
 recompute `resume_offset`.
@@ -852,11 +863,13 @@ Forked so the patches stay available regardless of upstream merge timing.
 5. **Suspend with `facetimehd` loaded** — the AUR package warns the module breaks
    suspend. Not reproduced for `s2idle`: a 60-second cycle resumed cleanly with the
    module loaded and the camera still streamed afterwards. Long cycles remain
-   untested. For hibernation the module is cleared: unloading it changes nothing,
-   the failure in issue 8 is identical with and without it.
+   untested. Hibernation works with the module loaded; it reinitialises the camera
+   from scratch on resume, firmware upload included.
 6. **Hibernation image size** — the snapshot is about 2.9–3.0 GB and scales with
-   the memory in use, so a busy session costs more. No write has ever been timed,
-   because no write has ever happened. Note that
+   the memory in use, so a busy session costs more. It is compressed on the way
+   out: 757457 pages (2.9 GB) became **894 MB** on disk, about 3.3:1, measured
+   with `nvme smart-log`. The whole cycle — snapshot, write, power-off, firmware,
+   GRUB, initramfs, passphrase, read-back, restore — took 114 s. Note that
    `PM: hibernation: Allocated 2991616 kbytes in 17.2 seconds (174.0 MB/s)` is the
    *preallocation of the snapshot in RAM*, not a disk write — it is printed on
    every attempt, successful or not, and an earlier version of this file read it as
@@ -867,50 +880,48 @@ Forked so the patches stay available regardless of upstream merge timing.
    then never sends a `Response`, even though the KDE backend is running and the
    permission is already granted. One thing to look at: an unsandboxed Firefox has an
    empty app ID, while the stored permission is keyed to `org.mozilla.firefox`.
-8. **Hibernation has never once written an image.** Not the lid path, not
-   `systemctl hibernate` — not a single attempt since `resume=` was added on
-   2026-09-20 09:34. Earlier notes here claiming a hand-triggered hibernation
-   "resumed fine" were wrong: those runs came back in the *same* boot with
-   `PM: hibernation: hibernation exit`, which looks like a successful resume
-   precisely because nothing was saved and the power was never cut.
+8. **Resolved: hibernation works — and how four hours were spent proving it did
+   not.** On 2026-09-20 this entry asserted that no image had ever been written.
+   That was wrong, and every piece of evidence for it turned out to be an artefact
+   of measuring a hibernation from inside the kernel that is being hibernated. The
+   real fault was the `brcmfmac` sleep hook, fixed earlier the same day; the only
+   real attempt made before that fix produced `PM: Image not found (code -22)`, and
+   every attempt afterwards was a `pm_test` or `disk=test_resume` rehearsal that
+   never cut power. The three traps are worth keeping, because each one is
+   convincing on its own:
 
-   What the kernel does, with `pm_debug_messages=1` and `disk=test_resume`:
+   - **`/proc/diskstats` cannot see the write.** Those counters are ordinary kernel
+     memory, so they are captured in the snapshot and rolled back by a successful
+     restore. Measuring the image this way always reads a few MB, no matter what
+     was written. The same effect wipes the printk ring buffer, which this file
+     already knew — it was simply never applied to the disk counters. Use the
+     NVMe controller's own `data_units_written`; it lives on the SSD.
+   - **Apple's controller reports `data_units_written` in plain 512-byte units**,
+     not the NVMe-standard 1000 × 512. Taking the spec at its word overstates every
+     figure by a factor of 1000. `tools/hib-smart-test.sh --calibrate` measures the
+     unit directly.
+   - **`Timekeeping suspended for N seconds` on the way back is not a stall.** The
+     restored kernel resumes *inside* the snapshot, so `timekeeping_resume()`
+     reports everything that happened since the snapshot was taken — the write, the
+     power-off, the boot, the read-back — as if the CPU had been stopped. Two
+     minutes there is a normal cycle, not a hang. For the same reason
+     `swsusp_save()` never appears to log its completion line `Image created (N
+     pages copied)`: that line is printed after the snapshot point, so a restore
+     rolls the buffer back past it. And the 80–90 ms between
+     `ACPI: PM: Waking up from system sleep state S4` and
+     `PM: hibernation: Basic memory bitmaps freed`, once read as proof that no 3 GB
+     write could have fitted, is simply the tail of the restore; the write happened
+     before that, invisibly.
 
-   ```
-   ACPI: PM: Preparing to enter system sleep state S4
-   ACPI: PM: Saving platform NVS memory
-   Disabling non-boot CPUs ... / Calling lapic_suspend
-   PM: hibernation: Creating image
-   PM: hibernation: Need to copy 738336 pages
-   PM: hibernation: Normal pages needed: 738336 + 1024, available pages: 1323495
-           <- stops here; screen black, board still powered, only the power
-              button brings it back, and it wakes rather than booting
-   ACPI: PM: Waking up from system sleep state S4
-   PM: hibernation: Hibernation image restored successfully.   <- the wrong branch
-   ```
+   One self-inflicted failure is worth recording too: a kprobe on
+   `copy_data_pages` hangs the machine hard enough to need a power cycle. That
+   function runs once per page — 757k times inside the snapshot with interrupts
+   off.
 
-   `swsusp_save()` never logs its completion line `Image created (N pages copied)`,
-   the device callbacks come back as `restore` rather than `thaw`, and the kernel
-   takes the "came back from an image" branch — which contains no write to swap.
-   `/sys/power/state` still returns 0, so `systemd-sleep` reports success and the
-   machine is powered off with an empty swap file; the next boot then reports
-   `PM: Image not found (code -22)`.
-
-   A check that needs no debug flag: the gap between
-   `ACPI: PM: Waking up from system sleep state S4` and
-   `PM: hibernation: Basic memory bitmaps freed` is 80–90 ms, far too short to
-   write a 3 GB image at the 700–2300 MB/s this machine manages.
-
-   Ruled out so far: the swap file and `resume_offset`
-   (`btrfs inspect-internal map-swapfile -r /swapfile` matches `/proc/cmdline`);
-   the EFI resume path; the power-off stage, which is never reached; `facetimehd`;
-   the `brcmfmac` hook; and the whole ACPI platform path — `pm_test=core` stops
-   immediately before the snapshot and returns on its own every time, so `_PTS(4)`,
-   the NVS save, the CPU offlining and `syscore_suspend()` are all healthy and
-   `disk=shutdown` would not help. What is left is the snapshot itself.
-
-   Next: boot the other installed kernel (6.19.10-300.fc44 beside 7.2.5-200.fc44)
-   and repeat with `pm_test=none`, `pm_debug_messages=1`, `disk=test_resume`.
+   Finally, `systemctl hibernate` ignores whatever you write to `/sys/power/disk`:
+   `systemd-sleep` writes its own `HibernateMode=` there immediately beforehand.
+   Choose the mode with a `/etc/systemd/sleep.conf.d/` drop-in. The confirmed run
+   used the default, `platform`, i.e. ACPI S4.
 
 9. **Testing hibernation without losing the session.** `/sys/power/pm_test` is a
    ladder — `freezer`, `devices`, `platform`, `processors`, `core` — and each rung
@@ -930,9 +941,18 @@ Forked so the patches stay available regardless of upstream merge timing.
      sync /var/log/sleep-hook.log; } 2>/dev/null
    ```
 
-   On this hardware there is also a free physical check: the Force Touch trackpad
-   has no mechanical click, so a trackpad that still clicks means the board has
-   power and the machine is not hibernated.
+   What those rehearsals cannot tell you is whether a *real* run cut power, since
+   a restored image prints the same lines either way. For that, read the SSD's own
+   counters around the run — `power_cycles` +1 with `unsafe_shutdowns` unchanged is
+   a clean power loss — and note whether the initramfs asked for the LUKS
+   passphrase, which it cannot skip. `tools/hib-real-test.sh` does the counter part
+   and keeps its baseline on disk, so the answer survives even a run that has to be
+   ended with a hard reset.
+
+   On this hardware there is also a free physical check, with one catch: the Force
+   Touch trackpad has no mechanical click, so a trackpad that still clicks means
+   the board has power. The catch is timing — the write takes about a minute with
+   the screen already dark, so a click during *that* proves nothing.
 
 ---
 
