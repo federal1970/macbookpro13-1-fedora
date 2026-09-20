@@ -256,17 +256,23 @@ the kernel restores its own state from the image and assumes the chip is still
 initialised. The cure is to unload the driver *before* hibernating, so the chip is
 shut down properly and brought up from scratch afterwards.
 
-`/usr/lib/systemd/system-sleep/brcmfmac-reload`:
+`/etc/systemd/system-sleep/brcmfmac-reload`:
 
 ```bash
 #!/usr/bin/env bash
-case "$1/$2" in
-  pre/*)
+# Only the hibernate phase may be touched — see the warning below.
+case "$SYSTEMD_SLEEP_ACTION" in
+  hibernate) ;;
+  *) exit 0 ;;
+esac
+
+case "$1" in
+  pre)
     systemctl stop NetworkManager
     modprobe -r brcmfmac_wcc 2>/dev/null
     modprobe -r brcmfmac
     ;;
-  post/*)
+  post)
     modprobe brcmfmac
     systemctl start NetworkManager
     ;;
@@ -274,31 +280,98 @@ esac
 ```
 
 ```bash
-sudo chmod +x /usr/lib/systemd/system-sleep/brcmfmac-reload
+sudo chmod +x /etc/systemd/system-sleep/brcmfmac-reload
 ```
 
-Verified: Wi-Fi reconnects by itself after hibernation. The hook also runs on
-ordinary suspend, where it is unnecessary but harmless — it only adds a short
-reconnect delay.
+Put the script in `/etc`, not in `/usr/lib/systemd/system-sleep/`: the latter
+belongs to the package manager and a systemd update wipes it.
+
+Verified for the reload itself: Wi-Fi reconnects by itself after hibernation.
+The `SYSTEMD_SLEEP_ACTION` filter is newer and has not been through a full
+cycle yet — see [open issues](#open-issues).
+
+> **Do not match on `"$1/$2"` here.** The obvious version of this hook —
+> `case "$1/$2" in pre/*) ... post/*) ...` — hangs the machine on
+> `suspend-then-hibernate`, and the failure looks like a resume problem rather
+> than a hook problem.
+>
+> `systemd-sleep` runs the hook around *each* phase, but the second argument
+> stays `suspend-then-hibernate` for both of them; the phase is only readable
+> from `SYSTEMD_SLEEP_ACTION` (`suspend`, `hibernate`, or
+> `suspend-after-failed-hibernate`) — see `man systemd-sleep`. A `pre/*`
+> pattern therefore fires four times per cycle instead of two. On the way out of
+> s2idle the `post` branch loads `brcmfmac` and starts NetworkManager, and
+> 300 ms later the `pre` branch tries to unload the module again, fails with
+> `modprobe: FATAL: Module brcmfmac is in use`, and the kernel begins writing the
+> hibernation image while the chip is still taking on its firmware:
+>
+> ```
+> 11:35:11.446  usbcore: registered new interface driver brcmfmac
+> 11:35:11.628  Starting NetworkManager.service...
+> 11:35:11.934  NetworkManager: caught SIGTERM, shutting down normally.
+> 11:35:11.976  modprobe: FATAL: Module brcmfmac is in use.
+> 11:35:11.980  Performing sleep operation 'hibernate'...
+> 11:35:12.070  brcmfmac: brcmf_c_process_clm_blob ...
+> 11:35:12.227  Filesystems sync: 0.066 seconds
+>               <- journal ends here
+> ```
+>
+> The image never gets written, and the next boot cold-starts with
+> `PM: Image not found (code -22)` — which sends you off measuring
+> `resume_offset`, where nothing is wrong.
 
 If this ever stops being enough, the next step is to power down the PCIe device
 itself via `remove` in sysfs before hibernating and `rescan` after.
 
 #### 4. Automatic sleep → hibernate
 
-`/etc/systemd/sleep.conf`:
+Two things have to line up: the lid has to ask for `suspend-then-hibernate`
+rather than a plain suspend, and the delay before the second phase has to be set.
+
+**The delay** — `/etc/systemd/sleep.conf`:
 
 ```
 [Sleep]
 HibernateDelaySec=15min
 ```
 
+Nothing needs restarting: `systemd-sleep` reads its configuration at the moment
+of going to sleep. A drop-in in `/etc/systemd/sleep.conf.d/` overrides this file,
+which is convenient for testing with a shorter delay — check what actually
+applies with `systemd-analyze cat-config systemd/sleep.conf`.
+
+**The lid** — **System Settings → Power Management**, and on Plasma 6 this is
+*not* the lid action:
+
+| Setting | Value |
+|---|---|
+| `When laptop lid closed` | `Sleep` — leave as is |
+| `When sleeping, enter` | **`Standby, then hibernate`** |
+
+The list of lid actions has no "sleep then hibernate" entry at all. The lid only
+selects *which* action runs; *what sleep means* is a separate dropdown, and that
+is the one to change. In `~/.config/powerdevilrc` it lands as `SleepMode=3`.
+
+The setting is **per power profile**, so it has to be set for battery and for AC
+separately — `[Battery][SuspendAndShutdown]` and `[AC][SuspendAndShutdown]`.
+Battery is the one that matters.
+
+Ignore the description KDE prints under the entry ("Switch to hibernation when
+battery runs low"). It is `systemd`'s `suspend-then-hibernate`, and the moment of
+transition is `HibernateDelaySec`; a low battery is an additional trigger, not the
+only one.
+
+To confirm it took, close the lid and reopen it within the delay — `logind`
+names the operation it was asked for as soon as the machine goes down:
+
 ```bash
-sudo systemctl restart systemd-logind
+journalctl -b 0 | grep 'will suspend'
 ```
 
-Then set the lid-close action to **"Sleep then hibernate"** in
-**System Settings → Power Management**.
+```
+The system will suspend and later hibernate now!   <- correct
+The system will suspend now!                       <- still a plain suspend
+```
 
 On choosing the interval: at 4.1 W every 15 minutes of waiting costs about 1 Wh,
 roughly 2% of the charge; 5 minutes would cost 0.7%. The point of the delay is that
@@ -764,6 +837,13 @@ Forked so the patches stay available regardless of upstream merge timing.
    then never sends a `Response`, even though the KDE backend is running and the
    permission is already granted. One thing to look at: an unsandboxed Firefox has an
    empty app ID, while the stored permission is keyed to `org.mozilla.firefox`.
+8. **The full lid → s2idle → hibernate → resume cycle has not been run end to end.**
+   The two halves are verified separately: the lid now asks for
+   `suspend-then-hibernate` (journal, and it returned cleanly from a 37-second
+   s2idle), and a hibernation triggered by hand resumed fine. What has never
+   completed is the two of them in one run — the only attempt died on the
+   transition, with the old `pre/*` hook reloading `brcmfmac` into the image
+   write. The hook is fixed, the rerun is pending.
 
 ---
 
