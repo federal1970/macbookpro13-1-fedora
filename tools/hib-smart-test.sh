@@ -17,21 +17,47 @@ STATE=${STATE:-/var/tmp/hib-smart-baseline}
 NVME=${NVME:-/dev/nvme0}
 DEV=${DEV:-nvme0n1}
 TIMEOUT=${TIMEOUT:-600}
-MODE=${1:-run}
+MODE=${1:-run}   # run | --compare | --calibrate
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
-# Data Units Written: one unit is 1000 * 512 bytes.
+# Data Units Written. The NVMe spec says one unit is 1000 * 512 bytes, but this
+# Apple controller reports plain 512-byte units -- a lifetime total of 225e9
+# units can only be 115 TB, never 115 PB. Run --calibrate to confirm it on any
+# other machine. UNIT_BYTES is what one unit is worth here.
+UNIT_BYTES=${UNIT_BYTES:-512}
 units_written() {
   local v
   v=$(nvme smart-log "$NVME" 2>/dev/null | awk -F: '/data_units_written/ {gsub(/[^0-9]/,"",$2); print $2; exit}')
   [ -z "$v" ] && v=$(smartctl -A "$NVME" 2>/dev/null | awk -F: '/Data Units Written/ {gsub(/[^0-9]/,"",$2); print $2; exit}')
   echo "${v:-}"
 }
-units_to_mb() { awk -v u="$1" 'BEGIN{printf "%.1f", u*512*1000/1048576}'; }
+units_to_mb() { awk -v u="$1" -v ub="$UNIT_BYTES" 'BEGIN{printf "%.1f", u*ub/1048576}'; }
 sectors_written() { awk -v d="$DEV" '$3==d {print $10}' /proc/diskstats; }
 
 say() { echo "$@" | tee -a "$REPORT"; sync; }
+
+# --- calibrate mode: how many bytes is one data unit on this controller? ---
+if [ "$MODE" = "--calibrate" ]; then
+  TMP=$(mktemp /var/tmp/hib-cal.XXXXXX) || exit 1
+  trap 'rm -f "$TMP"' EXIT
+  MB=512
+  C0=$(units_written)
+  dd if=/dev/zero of="$TMP" bs=1M count=$MB oflag=direct status=none || exit 1
+  sync
+  C1=$(units_written)
+  echo "wrote            : $MB MB with O_DIRECT"
+  echo "data units delta : $((C1 - C0))"
+  awk -v d="$((C1 - C0))" -v mb="$MB" 'BEGIN{
+    if (d <= 0) { print "bytes per unit   : could not tell (no delta)"; exit }
+    b = mb*1048576/d
+    printf "bytes per unit   : %.1f\n", b
+    if (b > 100 && b < 2000)        print "-> 512-byte units. UNIT_BYTES=512 is right for this controller.";
+    else if (b > 100000)            print "-> 1000*512 units, the NVMe standard. Re-run with UNIT_BYTES=512000.";
+    else                            print "-> unexpected; do not trust the MB figures without checking.";
+  }'
+  exit 0
+fi
 
 # --- compare mode: run this after a hard reset ----------------------------
 if [ "$MODE" = "--compare" ]; then
