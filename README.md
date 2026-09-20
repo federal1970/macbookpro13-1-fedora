@@ -439,11 +439,27 @@ The system will suspend and later hibernate now!   <- correct
 The system will suspend now!                       <- still a plain suspend
 ```
 
-On choosing the interval: at 4.1 W every 15 minutes of waiting costs about 1 Wh,
-roughly 2% of the charge; 5 minutes would cost 0.7%. The point of the delay is that
-short breaks — step away and come back — do not cost a full resume plus the LUKS
-passphrase. Arguing against a very short delay: 7.6 GB of image written to the NVMe
-every single time the lid closes.
+**Verified end to end, 2026-09-20.** Lid shut at 17:53:38 and not touched again:
+`logind` announced `The system will suspend and later hibernate now!`, s2idle
+held for exactly 15 min 1 s, the RTC alarm woke the machine at 18:08:40, it
+hibernated at 18:08:42 with the lid still down, and the next power-on asked for
+the passphrase and restored the session. Measured against the battery, the seven
+minutes it spent powered down cost nothing: 3.92 Wh went in 40 minutes, against
+3.80 Wh predicted by the awake and s2idle rates plus one transition.
+
+> **`Lid opened` in the journal at exactly the delay is a lie.** On the way out
+> of s2idle `logind` re-reads the lid switch and reports it open even when it is
+> not — it appeared at 18:08:40, one second before the hibernation, in a run
+> where the lid stayed shut until 18:14. It reads as though someone interrupted
+> the test. Both lid tests on 2026-09-20 produced it, exactly at the alarm.
+
+On choosing the interval: at 3.83 W every 15 minutes of waiting costs about
+0.96 Wh, roughly 2% of the charge; 5 minutes would cost 0.7%. Against that, one
+hibernate-and-return transition costs about 0.32 Wh, so the delay pays for itself
+after some five minutes with the lid shut. The other argument for not making it
+very short is wear: about 894 MB of compressed image written to the NVMe every
+time the lid closes for real. The point of the delay is that short breaks — step
+away and come back — cost neither.
 
 ### Battery data
 
