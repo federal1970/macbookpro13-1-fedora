@@ -962,51 +962,38 @@ Forked so the patches stay available regardless of upstream merge timing.
    *preallocation of the snapshot in RAM*, not a disk write — it is printed on
    every attempt, successful or not, and an earlier version of this file read it as
    proof of a working write.
-7. **The PipeWire camera portal never answers — the bug is in
-   `xdg-desktop-portal` itself.** Worked around with
-   `media.webrtc.camera.allow-pipewire=false`; the cause is now known, though not
-   fixed. `AccessCamera` hands back a request handle and no `Response` signal
-   ever follows.
-
-   It has nothing to do with Firefox. Reproduced from a plain shell:
-
-   ```bash
-   gdbus call --session --dest org.freedesktop.portal.Desktop \
-     --object-path /org/freedesktop/portal/desktop \
-     --method org.freedesktop.portal.Camera.AccessCamera "{}"
-   # -> (objectpath '/org/freedesktop/portal/desktop/request/1_176/t',)
-   # and nothing more, ever
-   ```
-
-   With `G_MESSAGES_DEBUG=all` on `xdg-desktop-portal.service` (1.22.1), the
-   whole of what it logs for such a call is:
+7. **The camera portal works; why Firefox needed a workaround is unknown.**
+   Firefox is still set to `media.webrtc.camera.allow-pipewire=false`. The
+   portal itself was exercised end to end on 2026-09-20 and did everything
+   correctly, so whatever the original problem was, it is not there:
 
    ```
-   Adding XdpAppInfo: XdpAppInfoHost app 'org.kde.konsole' for :1.176
-   Camera: sending response 0
-   GTask ... finalized without ever returning (using g_task_return_*()).
-       This potentially indicates a bug in the program.
-   Deleting XdpAppInfo: XdpAppInfoHost app 'org.kde.konsole' for :1.176
+   AccessCamera       -> Response 0 (allowed)
+   OpenPipeWireRemote -> valid fd
    ```
 
-   So the portal resolves an app id, decides **to allow** (`response 0`), and
-   then drops the task on the floor without emitting the signal. Everything the
-   earlier note suspected is innocent:
+   Two earlier diagnoses in this file were wrong, and both failed the same way —
+   the test, not the portal, was broken:
 
-   - **not the app id** — an unsandboxed process does not get an empty one; it is
-     derived from the process tree, here `org.kde.konsole` for a shell in
-     Konsole;
-   - **not the permission store** — `devices/camera` already holds
-     `{'org.kde.konsole': ['yes'], 'org.mozilla.firefox': ['yes']}`, which is why
-     the portal answers `0` rather than asking;
-   - **not the KDE backend** — `dbus-monitor` shows the portal never calls
-     `org.freedesktop.impl.portal.Access` at all, because with permission already
-     granted there is nothing to ask;
-   - **not PipeWire** — the failure is before any camera is opened.
+   - *"An `AccessCamera` call hands back a request handle and then never sends a
+     `Response`."* It does send one. `gdbus call` exits the moment it has the
+     handle, so there is no process left to receive the signal that follows. A
+     client that subscribes to `org.freedesktop.portal.Request.Response` and
+     stays alive gets it every time.
+   - *"`GTask ... finalized without ever returning` — the portal drops the task
+     without emitting the signal."* That warning is normal for this code.
+     `handle_access_camera_in_thread_func` in `src/camera.c` uses the task only
+     to get onto a thread, with no callback and no return value, and it emits the
+     response before returning. GLib warns about the pattern regardless.
 
-   Note also that no installed backend implements
-   `org.freedesktop.impl.portal.Camera`, and that is normal: the frontend has no
-   such impl interface. It uses `Access`.
+   Also worth recording, since it was suspected: no installed backend implements
+   `org.freedesktop.impl.portal.Camera`, and that is correct — the frontend has
+   no such impl interface and uses `Access`. And an unsandboxed process does not
+   get an empty app id; it is derived from the process tree.
+
+   **Next step is the cheap one: clear the Firefox pref and see whether the
+   camera still fails.** Two other entries in this list turned out to describe
+   problems that had already stopped existing.
 
 8. **Resolved: hibernation works — and how four hours were spent proving it did
    not.** On 2026-09-20 this entry asserted that no image had ever been written.
