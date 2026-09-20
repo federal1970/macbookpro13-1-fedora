@@ -962,12 +962,52 @@ Forked so the patches stay available regardless of upstream merge timing.
    *preallocation of the snapshot in RAM*, not a disk write — it is printed on
    every attempt, successful or not, and an earlier version of this file read it as
    proof of a working write.
-7. **The PipeWire camera portal returns nothing** — worked around with
-   `media.webrtc.camera.allow-pipewire=false`, but the cause is unknown. An
-   `org.freedesktop.portal.Camera.AccessCamera` call hands back a request handle and
-   then never sends a `Response`, even though the KDE backend is running and the
-   permission is already granted. One thing to look at: an unsandboxed Firefox has an
-   empty app ID, while the stored permission is keyed to `org.mozilla.firefox`.
+7. **The PipeWire camera portal never answers — the bug is in
+   `xdg-desktop-portal` itself.** Worked around with
+   `media.webrtc.camera.allow-pipewire=false`; the cause is now known, though not
+   fixed. `AccessCamera` hands back a request handle and no `Response` signal
+   ever follows.
+
+   It has nothing to do with Firefox. Reproduced from a plain shell:
+
+   ```bash
+   gdbus call --session --dest org.freedesktop.portal.Desktop \
+     --object-path /org/freedesktop/portal/desktop \
+     --method org.freedesktop.portal.Camera.AccessCamera "{}"
+   # -> (objectpath '/org/freedesktop/portal/desktop/request/1_176/t',)
+   # and nothing more, ever
+   ```
+
+   With `G_MESSAGES_DEBUG=all` on `xdg-desktop-portal.service` (1.22.1), the
+   whole of what it logs for such a call is:
+
+   ```
+   Adding XdpAppInfo: XdpAppInfoHost app 'org.kde.konsole' for :1.176
+   Camera: sending response 0
+   GTask ... finalized without ever returning (using g_task_return_*()).
+       This potentially indicates a bug in the program.
+   Deleting XdpAppInfo: XdpAppInfoHost app 'org.kde.konsole' for :1.176
+   ```
+
+   So the portal resolves an app id, decides **to allow** (`response 0`), and
+   then drops the task on the floor without emitting the signal. Everything the
+   earlier note suspected is innocent:
+
+   - **not the app id** — an unsandboxed process does not get an empty one; it is
+     derived from the process tree, here `org.kde.konsole` for a shell in
+     Konsole;
+   - **not the permission store** — `devices/camera` already holds
+     `{'org.kde.konsole': ['yes'], 'org.mozilla.firefox': ['yes']}`, which is why
+     the portal answers `0` rather than asking;
+   - **not the KDE backend** — `dbus-monitor` shows the portal never calls
+     `org.freedesktop.impl.portal.Access` at all, because with permission already
+     granted there is nothing to ask;
+   - **not PipeWire** — the failure is before any camera is opened.
+
+   Note also that no installed backend implements
+   `org.freedesktop.impl.portal.Camera`, and that is normal: the frontend has no
+   such impl interface. It uses `Access`.
+
 8. **Resolved: hibernation works — and how four hours were spent proving it did
    not.** On 2026-09-20 this entry asserted that no image had ever been written.
    That was wrong, and every piece of evidence for it turned out to be an artefact
