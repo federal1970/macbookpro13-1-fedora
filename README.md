@@ -530,6 +530,20 @@ Be aware that the `thunderbolt` module drives Thunderbolt devices on the USB-C
 ports. Plain flash drives and charging keep working without it; external displays
 over Thunderbolt and dock stations do not.
 
+**Keeping it blacklisted also saves about half a watt.** Measured 2026-09-20 on
+battery, idle, sampling `current_now` over 60–90 s, twice in each state:
+
+```
+thunderbolt loaded   : 9.27 W, 9.05 W
+thunderbolt unloaded : 8.51 W, 8.70 W
+                       -> about 0.55 W, well outside the ~0.2 W spread
+```
+
+It was worth checking the other way round, because with the module blacklisted
+nothing manages Alpine Ridge at all and four of its seven functions sit in `D0`.
+Loading the driver does not change that — still four in `D0` — it only adds its
+own activity. So there is no idle-power argument for loading it.
+
 ---
 
 ## Audio (Cirrus CS8409)
@@ -985,6 +999,14 @@ Forked so the patches stay available regardless of upstream merge timing.
    powered down on a machine anyone is using. Fixing runtime PM for Wi-Fi and
    the camera would still leave XHCI, Thunderbolt and SPI holding the package at
    C3.
+
+   The same firmware gap shows up one level down: **every PCI device on this
+   machine has `d3cold_allowed=0`.** Nothing is permitted to actually lose power,
+   only to idle in `D3hot`, because D3cold needs ACPI power resources (`_PR3`)
+   that the firmware does not declare. Alpine Ridge illustrates it — four of its
+   seven functions sit in `D0` with the driver blacklisted, and loading the
+   driver leaves them in `D0` while costing half a watt (see
+   [Disabling Thunderbolt](#disabling-thunderbolt-anyway)).
 
    Above all that, the firmware gives the OS no way in: no `PNP0D80` device, so
    nothing to call to enter S0ix, and part of the PMC is walled off —
