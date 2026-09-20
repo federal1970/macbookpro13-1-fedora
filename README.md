@@ -31,7 +31,8 @@ section.
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
-| **Suspend / resume** | **Fixed** | [Kernel parameters + boot-time script](#suspend--resume) |
+| **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
+| **Hibernation** | **The real fix** | [Swap file on btrfs, `resume=`, sleep-then-hibernate](#hibernation--the-solution) |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + a kernel 7.2 source fix](#camera-facetime-hd) |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
@@ -50,18 +51,26 @@ backlight, NVMe storage, battery reporting, and USB-C.
 
 ---
 
-## Suspend / resume
+## Sleep and hibernation
 
-The single most important fix. Without it, suspend is unusable.
+Suspend itself works — wake is instant and everything comes back. The problem is
+power: `s2idle` on this machine drains the battery at roughly the rate of a running
+system. The working arrangement is **suspend-then-hibernate**: s2idle for short
+breaks, hibernation after 15 minutes.
 
-Based on [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
+The suspend part is based on
+[Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
 ("Suspend working with Linux Mint 22.3 on 2016 Macbook (no touch bar)").
 
 ### 1. Kernel parameters
 
 ```bash
-sudo grubby --update-kernel=ALL --args="button.lid_init_state=open nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1 pci=noaer i915.enable_dc=0 i915.enable_fbc=0 i915.enable_psr=0 mem_sleep_default=s2idle"
+sudo grubby --update-kernel=ALL --args="button.lid_init_state=open nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1 pci=noaer i915.enable_fbc=0 mem_sleep_default=s2idle"
 ```
+
+`i915.enable_dc=0` and `i915.enable_psr=0` were part of the original recipe and have
+since been dropped: removing them changed nothing about the drain, and suspend works
+fine without them.
 
 ### 2. Boot-time fix script
 
@@ -107,8 +116,221 @@ sudo systemctl enable mbp-suspend-fix.service
 cat /sys/power/mem_sleep      # expected: [s2idle] deep
 ```
 
-**Result:** instant wake, USB and Wi-Fi alive afterwards. Verified over 30-second
-and 90-second suspends.
+**Result:** instant wake, USB and Wi-Fi alive afterwards — but see the drain figure
+below before relying on suspend alone.
+
+---
+
+### s2idle costs about 4.1 W
+
+Measured with the lid closed over 10 hours, from full charge down to 9%. Battery
+full capacity is 46.35 Wh (54.70 Wh by design, 15% wear, 518 cycles), so the drain
+works out to roughly **4.1 W** — the consumption of a running machine with the
+screen off. A healthy `s2idle` on Skylake sits in the tenths of a watt.
+
+### Why: S0ix is unreachable
+
+```bash
+sudo mount -t debugfs none /sys/kernel/debug 2>/dev/null
+sudo cat /sys/kernel/debug/pmc_core/slp_s0_residency_usec
+sudo cat /sys/kernel/debug/pmc_core/package_cstate_show
+```
+
+```
+slp_s0_residency_usec: 0
+
+Package C2 : 189515513
+Package C3 : 44193409333
+Package C6 : 0
+Package C7 : 0
+Package C8 : 0
+Package C9 : 0
+Package C10 : 0
+```
+
+The package never goes deeper than C3 — neither while suspended nor while idle. S0ix
+residency requires C7 or deeper, hence the zero counter.
+
+The firmware does advertise S0:
+
+```console
+$ journalctl -k -b | grep -iE "ACPI.*[Ss]upports"
+ACPI: PM: (supports S0 S3 S4 S5)
+```
+
+but there is no Low Power S0 Idle ACPI device:
+
+```console
+$ ls /sys/bus/acpi/devices/ | grep -i PNP0D80
+(empty)
+```
+
+Without `PNP0D80` the kernel never enables the S0ix path at all.
+
+**This is not caused by the parameters above.** Both suspects were removed and the
+measurement repeated:
+
+```bash
+sudo grubby --update-kernel=ALL --remove-args="nvme_core.default_ps_max_latency_us=0"
+sudo systemctl disable mbp-suspend-fix.service
+sudo reboot
+```
+
+C6 and deeper stayed at zero. With no gain to show for it, both were put back:
+
+```bash
+sudo grubby --update-kernel=ALL --args="nvme_core.default_ps_max_latency_us=0"
+sudo systemctl enable mbp-suspend-fix.service
+```
+
+### Why not `deep`
+
+`echo deep | sudo tee /sys/power/mem_sleep` fails in two ways:
+
+- The machine wakes itself about 10 seconds after going to sleep.
+- After that wake Wi-Fi is dead, and neither reloading the driver nor a `reboot`
+  brings it back — only a full power cycle does.
+- The spurious wake cannot be traced: `/sys/power/pm_wakeup_irq` is empty, meaning
+  the wakeup arrives over an ACPI GPE rather than an ordinary interrupt.
+
+These are exactly the symptoms that make issue #207 recommend `s2idle`.
+
+---
+
+### Hibernation — the solution
+
+S4 is advertised by the firmware. The disk here is btrfs on LUKS with 213 GB free,
+and swap is zram only, which cannot be hibernated to.
+
+#### 1. Swap file
+
+```bash
+btrfs --version          # mkswapfile has been available since 6.1
+df -h /
+
+sudo btrfs filesystem mkswapfile --size 10g --uuid clear /swapfile
+sudo swapon /swapfile
+swapon --show
+```
+
+`mkswapfile` sets NOCOW and disables compression by itself — nothing to do by hand.
+
+In `/etc/fstab`:
+
+```
+/swapfile none swap defaults 0 0
+```
+
+#### 2. Resume parameters
+
+```bash
+sudo btrfs inspect-internal map-swapfile -r /swapfile
+```
+
+The UUID is the same one that appears in `root=` — the UUID of the *decrypted* btrfs
+volume, not of the LUKS container:
+
+```bash
+sudo grubby --update-kernel=ALL --args="resume=UUID=d816faf6-073e-4b77-88fb-bde89b123bea resume_offset=<number from map-swapfile>"
+sudo dracut -f
+sudo reboot
+```
+
+Check it:
+
+```bash
+cat /proc/cmdline
+sudo systemctl hibernate
+```
+
+Resume on top of LUKS works: the initramfs decrypts the volume before restoring the
+image, so the passphrase is asked for at power-on as usual.
+
+**The offset belongs to that one file.** Recreate the swap file and you have to
+recompute `resume_offset`.
+
+#### 3. Wi-Fi after hibernation
+
+The same problem as with `deep` comes back: hibernation cuts power to the BCM4350,
+the kernel restores its own state from the image and assumes the chip is still
+initialised. The cure is to unload the driver *before* hibernating, so the chip is
+shut down properly and brought up from scratch afterwards.
+
+`/usr/lib/systemd/system-sleep/brcmfmac-reload`:
+
+```bash
+#!/usr/bin/env bash
+case "$1/$2" in
+  pre/*)
+    systemctl stop NetworkManager
+    modprobe -r brcmfmac_wcc 2>/dev/null
+    modprobe -r brcmfmac
+    ;;
+  post/*)
+    modprobe brcmfmac
+    systemctl start NetworkManager
+    ;;
+esac
+```
+
+```bash
+sudo chmod +x /usr/lib/systemd/system-sleep/brcmfmac-reload
+```
+
+Verified: Wi-Fi reconnects by itself after hibernation. The hook also runs on
+ordinary suspend, where it is unnecessary but harmless — it only adds a short
+reconnect delay.
+
+If this ever stops being enough, the next step is to power down the PCIe device
+itself via `remove` in sysfs before hibernating and `rescan` after.
+
+#### 4. Automatic sleep → hibernate
+
+`/etc/systemd/sleep.conf`:
+
+```
+[Sleep]
+HibernateDelaySec=15min
+```
+
+```bash
+sudo systemctl restart systemd-logind
+```
+
+Then set the lid-close action to **"Sleep then hibernate"** in
+**System Settings → Power Management**.
+
+On choosing the interval: at 4.1 W every 15 minutes of waiting costs about 1 Wh,
+roughly 2% of the charge; 5 minutes would cost 0.7%. The point of the delay is that
+short breaks — step away and come back — do not cost a full resume plus the LUKS
+passphrase. Arguing against a very short delay: 7.6 GB of image written to the NVMe
+every single time the lid closes.
+
+### Battery data
+
+```bash
+upower -i /org/freedesktop/UPower/devices/battery_BAT0
+```
+
+| Field | Value |
+|---|---|
+| energy-full | 46.35 Wh |
+| energy-full-design | 54.70 Wh |
+| wear | 15% |
+| charge cycles | 518 |
+
+Beware of the two different meanings of "capacity": in `upower` output the
+`capacity` field is the *wear level* (84.7%), not the charge. And
+`/sys/class/power_supply/BAT0/capacity` on this machine reports a percentage of the
+**design** capacity, so at a full charge it reads 85 while KDE shows 100 (KDE counts
+against the current full capacity). For measurements, watt-hours are the reliable
+source:
+
+```bash
+cat /sys/class/power_supply/BAT0/energy_now; date
+```
+
+---
 
 ### Thunderbolt is *not* the cause
 
@@ -191,7 +413,8 @@ From the project README:
 - The microphone is not fully finished — the recording level is very low (as it is
   under macOS) and needs software amplification.
 - Suspend behaviour was not tested by the author; the hardware stays permanently
-  powered on. Worth re-checking suspend and battery drain after installing this.
+  powered on. That may be one contributor to the
+  [4.1 W idle drain](#s2idle-costs-about-41-w) measured here — unverified.
 
 ---
 
@@ -330,7 +553,8 @@ connected immediately. The router-side cause was not chased down. Candidates:
 | PMF set to *required* | Set to *optional* on the router |
 | 5 GHz channel in the DFS range | Pin the router to a non-DFS channel |
 
-Reloading the module requires stopping NetworkManager first:
+Reloading the module requires stopping NetworkManager first — the same sequence the
+[hibernation hook](#3-wi-fi-after-hibernation) runs automatically:
 
 ```bash
 sudo systemctl stop NetworkManager
@@ -403,15 +627,19 @@ Forked so the patches stay available regardless of upstream merge timing.
 
 ## Open issues
 
-1. **Suspend, long duration** — tested only up to 90 seconds. A 15-minute suspend
-   and the battery drain over it are unmeasured. `s2idle` saves less power than
-   `deep`; measure with `cat /sys/class/power_supply/BAT0/capacity` before and after.
+1. **Package C-states never go below C3** — this is what makes S0ix, and therefore a
+   low-power `s2idle`, impossible. No `PNP0D80` ACPI device is exposed by the
+   firmware. Unclear whether anything on the OS side can change that.
 2. **Microphone** — check the recording level and the Analogue Stereo Duplex profile.
 3. **Wi-Fi on the main router** — identify what actually blocks the connection.
-4. **Suspend after the audio driver** — its README warns the hardware stays
-   permanently powered on; re-test suspend and battery drain.
-5. **Suspend with `facetimehd` loaded** — verify the AUR package's warning about the
-   module breaking suspend.
+4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
+   permanently powered on; the 4.1 W idle drain may partly come from there. Worth
+   measuring with the module unloaded.
+5. **Suspend and hibernation with `facetimehd` loaded** — verify the AUR package's
+   warning about the module breaking suspend.
+6. **Hibernation image size** — 7.6 GB written to the NVMe on every lid close once
+   `HibernateDelaySec` elapses. Compression (`resumeflags`, or shrinking the swap
+   file) has not been looked at.
 
 ---
 
