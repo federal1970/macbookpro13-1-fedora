@@ -26,7 +26,7 @@ section.
 | Component | Status | What it takes |
 |---|---|---|
 | Graphics (Iris 540, i915) | Works out of the box | — |
-| Wi-Fi (BCM4350) | Works | [Harmless firmware errors](#wi-fi-bcm4350); one router needed investigation |
+| Wi-Fi (BCM4350) | Works | [Harmless firmware errors](#wi-fi-bcm4350); no WPA3 on this chip, so it uses a [WPA2 SSID](#wpa3-is-out-of-reach-use-a-wpa2-ssid) |
 | Bluetooth | Works out of the box | — |
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
@@ -811,27 +811,36 @@ Those files are optional; the driver continues with built-in values. The related
 `device may have limited channels available` warning means a reduced 5 GHz channel
 list.
 
-### "Networks are visible but connecting hangs forever"
+### WPA3 is out of reach; use a WPA2 SSID
 
-Reproduced on one particular router; a separate access point with plain WPA2
-connected immediately. The router-side cause was not chased down. Candidates:
+The BCM4350 here cannot do WPA3, and no amount of configuration changes that.
+`iw list` prints the whole of what the driver offers:
 
-| Suspect | Mitigation |
-|---|---|
-| Mixed WPA2/WPA3 transition mode | `modprobe brcmfmac feature_disable=0x82000` |
-| PMF set to *required* | Set to *optional* on the router |
-| 5 GHz channel in the DFS range | Pin the router to a non-DFS channel |
-
-Reloading the module requires stopping NetworkManager first — the same sequence the
-[hibernation hook](#3-wi-fi-after-hibernation) runs automatically:
-
-```bash
-sudo systemctl stop NetworkManager
-sudo modprobe -r brcmfmac_wcc
-sudo modprobe -r brcmfmac
-sudo modprobe brcmfmac feature_disable=0x82000
-sudo systemctl start NetworkManager
 ```
+Supported extended features:
+	* [ CQM_RSSI_LIST ]
+	* [ DFS_OFFLOAD ]
+```
+
+No `SAE_OFFLOAD`, and `Supported commands` has `connect` but neither
+`authenticate` nor `external_auth` — and those are the only two routes by which
+`brcmfmac` can do SAE. The firmware in use is dated November 2015; WPA3 was
+ratified in 2018. Protected management frames *are* supported (`CMAC` appears
+among the ciphers), so that side is fine.
+
+The arrangement here is a separate WPA2 SSID on the same router for this
+machine. It associates instantly and needs nothing special.
+
+> **KDE will create a WPA3-only profile for a mixed network.** If the SSID
+> advertises both `psk` and `sae`, the applet picks `sae`, and the connection
+> then fails with `wpa_supplicant: WPA: Failed to select authenticated key
+> management type` — no association is even attempted, and NetworkManager
+> eventually reports the misleading `ssid-not-found`. Fix the profile rather
+> than the router:
+>
+> ```bash
+> nmcli con modify "<SSID>" 802-11-wireless-security.key-mgmt wpa-psk
+> ```
 
 ---
 
@@ -907,7 +916,9 @@ Forked so the patches stay available regardless of upstream merge timing.
    and unmuted under the `analog-stereo` profile. Where the original claim came
    from is not recorded, so it may have predated the CS8409 driver being set up
    properly. Nothing to do.
-3. **Wi-Fi on the main router** — identify what actually blocks the connection.
+3. **Resolved: Wi-Fi on the main router.** Not a defect. That SSID is WPA3, and
+   this chip has no WPA3 — see [above](#wpa3-is-out-of-reach-use-a-wpa2-ssid). A
+   separate WPA2 SSID on the same router serves this machine.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
    measuring with the module unloaded.
