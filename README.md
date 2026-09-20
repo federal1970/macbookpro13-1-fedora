@@ -32,7 +32,7 @@ section.
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
 | **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
-| **Hibernation** | **The real fix** | [Swap file on btrfs, `resume=`, sleep-then-hibernate](#hibernation--the-solution) |
+| **Hibernation** | **Does not work** | [Set up as documented](#hibernation--the-intended-solution), but the kernel never writes the image — see [open issues](#open-issues) |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
@@ -55,8 +55,10 @@ backlight, NVMe storage, battery reporting, and USB-C.
 
 Suspend itself works — wake is instant and everything comes back. The problem is
 power: `s2idle` on this machine drains the battery at roughly the rate of a running
-system. The working arrangement is **suspend-then-hibernate**: s2idle for short
-breaks, hibernation after 15 minutes.
+system. The intended arrangement is **suspend-then-hibernate**: s2idle for short
+breaks, hibernation after 15 minutes. The suspend half works. The hibernate half
+does not: the machine has never once written an image — see
+[open issues](#open-issues).
 
 The suspend part is based on
 [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
@@ -197,7 +199,12 @@ These are exactly the symptoms that make issue #207 recommend `s2idle`.
 
 ---
 
-### Hibernation — the solution
+### Hibernation — the intended solution
+
+> **This does not work yet.** Everything below is set up on the machine and each
+> piece checks out on its own, but the kernel never gets as far as writing the
+> image, so nothing is ever restored. Read it as the configuration, not as a
+> working recipe. The [open issues](#open-issues) have the current state.
 
 S4 is advertised by the firmware. The disk here is btrfs on LUKS with 213 GB free,
 and swap is zram only, which cannot be hibernated to.
@@ -243,8 +250,15 @@ cat /proc/cmdline
 sudo systemctl hibernate
 ```
 
-Resume on top of LUKS works: the initramfs decrypts the volume before restoring the
-image, so the passphrase is asked for at power-on as usual.
+**A machine that comes back is not a success.** If it returns to the same desktop
+without a reboot, it never hibernated — the journal will show
+`PM: hibernation: hibernation exit` in the *same* boot and no image write. A real
+run writes for several seconds, powers off completely, and the next boot continues
+the same boot id. On this machine only the first of those has ever been observed.
+
+Resume on top of LUKS is expected to work once the write does: the initramfs
+decrypts the volume before restoring the image, so the passphrase is asked for at
+power-on as usual. Untested — nothing has been restored yet.
 
 **The offset belongs to that one file.** Recreate the swap file and you have to
 recompute `resume_offset`.
@@ -256,7 +270,7 @@ the kernel restores its own state from the image and assumes the chip is still
 initialised. The cure is to unload the driver *before* hibernating, so the chip is
 shut down properly and brought up from scratch afterwards.
 
-`/etc/systemd/system-sleep/brcmfmac-reload`:
+`/usr/lib/systemd/system-sleep/brcmfmac-reload`:
 
 ```bash
 #!/usr/bin/env bash
@@ -280,15 +294,26 @@ esac
 ```
 
 ```bash
-sudo chmod +x /etc/systemd/system-sleep/brcmfmac-reload
+sudo chmod +x /usr/lib/systemd/system-sleep/brcmfmac-reload
 ```
 
-Put the script in `/etc`, not in `/usr/lib/systemd/system-sleep/`: the latter
-belongs to the package manager and a systemd update wipes it.
+> **It has to be `/usr/lib`, not `/etc`.** `systemd-sleep` reads
+> `/usr/lib/systemd/system-sleep/` and nothing else — there is no
+> `/etc/systemd/system-sleep/`, unlike `/etc/systemd/system/`. A hook put there is
+> silently never executed, with no error anywhere:
+>
+> ```bash
+> strings /usr/lib/systemd/systemd-sleep | grep system-sleep   # one path only
+> man systemd-sleep
+> ```
+>
+> Nor does a package update wipe it: rpm owns the directory (via `systemd-udev`)
+> but no file inside it, so a foreign file there survives.
 
-Verified for the reload itself: Wi-Fi reconnects by itself after hibernation.
-The `SYSTEMD_SLEEP_ACTION` filter is newer and has not been through a full
-cycle yet — see [open issues](#open-issues).
+Verified: with the hook in the right place, `SYSTEMD_SLEEP_ACTION=hibernate`
+matches, the module is unloaded before the image stage and reloaded afterwards,
+and Wi-Fi reconnects by itself. To confirm it ran at all, have it append to a log
+and `sync` — the snippet is in [open issues](#open-issues).
 
 > **Do not match on `"$1/$2"` here.** The obvious version of this hook —
 > `case "$1/$2" in pre/*) ... post/*) ...` — hangs the machine on
@@ -316,9 +341,11 @@ cycle yet — see [open issues](#open-issues).
 >               <- journal ends here
 > ```
 >
-> The image never gets written, and the next boot cold-starts with
-> `PM: Image not found (code -22)` — which sends you off measuring
-> `resume_offset`, where nothing is wrong.
+> That race is real and worth avoiding. It was also blamed, wrongly, for the
+> missing hibernation image: the image is not written on this machine whether the
+> hook runs, misfires or is absent entirely, so `PM: Image not found (code -22)`
+> on the next boot has a different cause. Either way it is not `resume_offset`,
+> where nothing is wrong.
 
 If this ever stops being enough, the next step is to power down the PCIe device
 itself via `remove` in sysfs before hibernating and `rescan` after.
@@ -822,28 +849,90 @@ Forked so the patches stay available regardless of upstream merge timing.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
    measuring with the module unloaded.
-5. **Suspend and hibernation with `facetimehd` loaded** — the AUR package warns the
-   module breaks suspend. Not reproduced: one 60-second `s2idle` cycle and one
-   hibernation cycle both resumed cleanly with the module loaded, and the camera
-   still streamed afterwards. Long cycles remain untested.
-6. **Hibernation image size** — measured once at 2.9 GB, written in 17.2 s at
-   174 MB/s (`PM: hibernation: Allocated 2991616 kbytes`). It scales with the memory
-   in use, so a busy session costs more, and every lid close pays it once
-   `HibernateDelaySec` elapses. Whether that write is worth shrinking has not been
-   looked at.
+5. **Suspend with `facetimehd` loaded** — the AUR package warns the module breaks
+   suspend. Not reproduced for `s2idle`: a 60-second cycle resumed cleanly with the
+   module loaded and the camera still streamed afterwards. Long cycles remain
+   untested. For hibernation the module is cleared: unloading it changes nothing,
+   the failure in issue 8 is identical with and without it.
+6. **Hibernation image size** — the snapshot is about 2.9–3.0 GB and scales with
+   the memory in use, so a busy session costs more. No write has ever been timed,
+   because no write has ever happened. Note that
+   `PM: hibernation: Allocated 2991616 kbytes in 17.2 seconds (174.0 MB/s)` is the
+   *preallocation of the snapshot in RAM*, not a disk write — it is printed on
+   every attempt, successful or not, and an earlier version of this file read it as
+   proof of a working write.
 7. **The PipeWire camera portal returns nothing** — worked around with
    `media.webrtc.camera.allow-pipewire=false`, but the cause is unknown. An
    `org.freedesktop.portal.Camera.AccessCamera` call hands back a request handle and
    then never sends a `Response`, even though the KDE backend is running and the
    permission is already granted. One thing to look at: an unsandboxed Firefox has an
    empty app ID, while the stored permission is keyed to `org.mozilla.firefox`.
-8. **The full lid → s2idle → hibernate → resume cycle has not been run end to end.**
-   The two halves are verified separately: the lid now asks for
-   `suspend-then-hibernate` (journal, and it returned cleanly from a 37-second
-   s2idle), and a hibernation triggered by hand resumed fine. What has never
-   completed is the two of them in one run — the only attempt died on the
-   transition, with the old `pre/*` hook reloading `brcmfmac` into the image
-   write. The hook is fixed, the rerun is pending.
+8. **Hibernation has never once written an image.** Not the lid path, not
+   `systemctl hibernate` — not a single attempt since `resume=` was added on
+   2026-09-20 09:34. Earlier notes here claiming a hand-triggered hibernation
+   "resumed fine" were wrong: those runs came back in the *same* boot with
+   `PM: hibernation: hibernation exit`, which looks like a successful resume
+   precisely because nothing was saved and the power was never cut.
+
+   What the kernel does, with `pm_debug_messages=1` and `disk=test_resume`:
+
+   ```
+   ACPI: PM: Preparing to enter system sleep state S4
+   ACPI: PM: Saving platform NVS memory
+   Disabling non-boot CPUs ... / Calling lapic_suspend
+   PM: hibernation: Creating image
+   PM: hibernation: Need to copy 738336 pages
+   PM: hibernation: Normal pages needed: 738336 + 1024, available pages: 1323495
+           <- stops here; screen black, board still powered, only the power
+              button brings it back, and it wakes rather than booting
+   ACPI: PM: Waking up from system sleep state S4
+   PM: hibernation: Hibernation image restored successfully.   <- the wrong branch
+   ```
+
+   `swsusp_save()` never logs its completion line `Image created (N pages copied)`,
+   the device callbacks come back as `restore` rather than `thaw`, and the kernel
+   takes the "came back from an image" branch — which contains no write to swap.
+   `/sys/power/state` still returns 0, so `systemd-sleep` reports success and the
+   machine is powered off with an empty swap file; the next boot then reports
+   `PM: Image not found (code -22)`.
+
+   A check that needs no debug flag: the gap between
+   `ACPI: PM: Waking up from system sleep state S4` and
+   `PM: hibernation: Basic memory bitmaps freed` is 80–90 ms, far too short to
+   write a 3 GB image at the 700–2300 MB/s this machine manages.
+
+   Ruled out so far: the swap file and `resume_offset`
+   (`btrfs inspect-internal map-swapfile -r /swapfile` matches `/proc/cmdline`);
+   the EFI resume path; the power-off stage, which is never reached; `facetimehd`;
+   the `brcmfmac` hook; and the whole ACPI platform path — `pm_test=core` stops
+   immediately before the snapshot and returns on its own every time, so `_PTS(4)`,
+   the NVS save, the CPU offlining and `syscore_suspend()` are all healthy and
+   `disk=shutdown` would not help. What is left is the snapshot itself.
+
+   Next: boot the other installed kernel (6.19.10-300.fc44 beside 7.2.5-200.fc44)
+   and repeat with `pm_test=none`, `pm_debug_messages=1`, `disk=test_resume`.
+
+9. **Testing hibernation without losing the session.** `/sys/power/pm_test` is a
+   ladder — `freezer`, `devices`, `platform`, `processors`, `core` — and each rung
+   stops one step deeper, waits 5 seconds and returns without writing anything or
+   cutting power. `core` covers everything except the snapshot copy.
+   `/sys/power/disk=test_resume` is meant to go one further — write a real image,
+   then check and restore it in the same boot with no power-off — which is how
+   issue 8 was pinned down to the snapshot. Both leave the journal intact, and that
+   matters: kernel messages after `PM: hibernation: hibernation entry` are buffered
+   and only reach disk if the machine comes back. A sleep hook that logs and
+   `sync`s survives even a run that does not:
+
+   ```bash
+   { printf '%s  arg1=%s arg2=%s SYSTEMD_SLEEP_ACTION=%s\n' \
+       "$(date '+%F %T.%3N')" "$1" "$2" "${SYSTEMD_SLEEP_ACTION-<unset>}" \
+       >> /var/log/sleep-hook.log
+     sync /var/log/sleep-hook.log; } 2>/dev/null
+   ```
+
+   On this hardware there is also a free physical check: the Force Touch trackpad
+   has no mechanical click, so a trackpad that still clicks means the board has
+   power and the machine is not hibernated.
 
 ---
 
