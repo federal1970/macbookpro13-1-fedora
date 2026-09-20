@@ -982,6 +982,47 @@ Forked so the patches stay available regardless of upstream merge timing.
    trackpad is **not** such a check, whatever earlier revisions of this file said
    — see the hibernation chapter.
 
+10. **Resolved: what actually blocked s2idle → hibernation.** The `brcmfmac`
+    sleep hook, and nothing else. It is needed because the BCM4350 does not
+    survive a loss of power, so the module has to come out before the image is
+    written; but the hook failed in two different ways, and both look like a
+    resume fault or a bad `resume_offset` rather than a hook fault. That is why a
+    whole session went into `resume_offset`, where nothing was ever wrong.
+
+    **Wrong directory — the hook never ran at all.** `systemd-sleep` reads
+    `/usr/lib/systemd/system-sleep/` and only that. There is no
+    `/etc/systemd/system-sleep/` for it, unlike `/etc/systemd/system/`, and a
+    hook placed there is silently never executed, with no error anywhere. The
+    2026-09-20 12:06 attempt ran that way: nothing unloaded the module, and the
+    next boot reported `PM: Image not found (code -22)`.
+
+    ```bash
+    strings /usr/lib/systemd/systemd-sleep | grep system-sleep   # one path only
+    ```
+
+    **Wrong condition — the hook fired in the wrong phase.** The obvious
+    `case "$1/$2" in pre/*) ... post/*)` breaks `suspend-then-hibernate`, because
+    the second argument stays `suspend-then-hibernate` through *both* phases; the
+    phase is readable only from `SYSTEMD_SLEEP_ACTION`. The pattern therefore
+    fires four times per cycle instead of two, and coming out of s2idle it
+    reloads the module exactly as the image write starts:
+
+    ```
+    11:35:11.446  usbcore: registered new interface driver brcmfmac   <- post loads it
+    11:35:11.628  Starting NetworkManager.service...
+    11:35:11.976  modprobe: FATAL: Module brcmfmac is in use.         <- pre cannot unload it
+    11:35:11.980  Performing sleep operation 'hibernate'...
+    11:35:12.070  brcmfmac: brcmf_c_process_clm_blob ...              <- firmware loading
+    11:35:12.227  Filesystems sync: 0.066 seconds
+                  <- journal ends here
+    ```
+
+    Both cured by commit `e3859cb`: filter on `SYSTEMD_SLEEP_ACTION`, keep the
+    file in `/usr/lib`. The listing in
+    [Wi-Fi after hibernation](#3-wi-fi-after-hibernation) is the fixed version.
+    Everything documented in issue 8 was measured *after* this fix and therefore
+    described a machine that already worked.
+
 ---
 
 ## References
