@@ -34,7 +34,7 @@ section.
 | **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
 | **Hibernation** | **The real fix** | [Swap file on btrfs, `resume=`, sleep-then-hibernate](#hibernation--the-solution) |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
-| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps |
+| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Partially working | Very low recording level — see [open issues](#open-issues) |
 
@@ -583,6 +583,57 @@ Cheese does, must finish rather than stall:
 gst-launch-1.0 v4l2src device=/dev/video0 num-buffers=60 ! videoconvert ! fakesink sync=true
 ```
 
+### 6. Firefox: `NotFoundError` with a camera that works
+
+Cheese plays, `ffmpeg` captures, and Firefox still reports no camera at all:
+
+```
+Could not find a web camera, however there are other media devices.
+NotFoundError: The object can not be found here.; DOMException
+```
+
+Nothing is wrong below the browser. Worth confirming before chasing the driver: the
+V4L2 ioctls all answer (`VIDIOC_QUERYCAP`, `ENUM_FMT`, `ENUM_FRAMESIZES`,
+`ENUM_FRAMEINTERVALS`), `/dev/video0` is reachable through a per-seat ACL rather than
+the `video` group, and PipeWire exposes the device properly:
+
+```console
+$ wpctl status | grep -i facetime
+ │      52. Apple Facetime HD                   [v4l2]
+ │  *   61. Apple Facetime HD (V4L2)
+
+$ pw-cli info 61 | grep media.role
+*		media.role = "Camera"
+```
+
+The cause is that Firefox 156 reaches for the camera through the PipeWire portal
+instead of opening the device directly, and that path yields nothing here. Two runs
+of the same page on a scratch profile, with only this pref differing:
+
+```
+media.webrtc.camera.allow-pipewire=true   ->  no answer in 25 s, no devices
+media.webrtc.camera.allow-pipewire=false  ->  Capture Devices: 1
+                                              GUM_OK: Apple Facetime HD
+```
+
+**The fix:** in `about:config` set **`media.webrtc.camera.allow-pipewire`** to
+**`false`** and restart Firefox.
+
+To reproduce the diagnosis on your own machine, the camera engine will say how many
+devices it found:
+
+```bash
+MOZ_LOG="CamerasChild:5,CamerasParent:5" MOZ_LOG_FILE=/tmp/ff.txt \
+  firefox --headless --new-instance --profile /tmp/ffprof about:blank
+grep -a "Capture Devices:" /tmp/ff.txt*
+```
+
+Why the portal path fails is *not* settled — see [open issues](#open-issues). It is
+not a missing permission: the KDE portal backend is alive on the bus, the camera
+portal reports `IsCameraPresent = true`, and the permission store already holds
+`camera: yes` for `org.mozilla.firefox`. A direct `AccessCamera` call simply never
+returns a response.
+
 **A warning carried over from the AUR package** of the same driver: keeping the
 module permanently loaded may break suspend. Not reproduced here yet, but worth
 watching. To back out: `sudo dkms remove facetimehd/0.6.13 --all`.
@@ -703,6 +754,12 @@ Forked so the patches stay available regardless of upstream merge timing.
 6. **Hibernation image size** — 7.6 GB written to the NVMe on every lid close once
    `HibernateDelaySec` elapses. Compression (`resumeflags`, or shrinking the swap
    file) has not been looked at.
+7. **The PipeWire camera portal returns nothing** — worked around with
+   `media.webrtc.camera.allow-pipewire=false`, but the cause is unknown. An
+   `org.freedesktop.portal.Camera.AccessCamera` call hands back a request handle and
+   then never sends a `Response`, even though the KDE backend is running and the
+   permission is already granted. One thing to look at: an unsandboxed Firefox has an
+   empty app ID, while the stored permission is keyed to `org.mozilla.firefox`.
 
 ---
 
