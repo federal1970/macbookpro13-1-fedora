@@ -36,7 +36,7 @@ section.
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
-| Microphone | Partially working | Very low recording level — see [open issues](#open-issues) |
+| Microphone | Works | Nothing to set; the earlier "very low level" note was wrong — see [open issues](#open-issues) |
 
 Idle temperature sits around **45 °C**, which is normal for Skylake. macOS runs
 cooler because Apple parks cores more aggressively.
@@ -899,7 +899,14 @@ Forked so the patches stay available regardless of upstream merge timing.
 1. **Package C-states never go below C3** — this is what makes S0ix, and therefore a
    low-power `s2idle`, impossible. No `PNP0D80` ACPI device is exposed by the
    firmware. Unclear whether anything on the OS side can change that.
-2. **Microphone** — check the recording level and the Analogue Stereo Duplex profile.
+2. **Resolved: the microphone is fine.** This entry used to say the recording
+   level was very low. It is not — a Telegram call came through normally, and the
+   mixer needs nothing done to it: `Internal Mic Capture Volume` is already at
+   63/63 (+12 dB), `Internal Mic Boost` at 2/2 (+20 dB), the capture switch on,
+   `Capture Source` on `Internal Mic`, and PipeWire's own source volume at 100%
+   and unmuted under the `analog-stereo` profile. Where the original claim came
+   from is not recorded, so it may have predated the CS8409 driver being set up
+   properly. Nothing to do.
 3. **Wi-Fi on the main router** — identify what actually blocks the connection.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
