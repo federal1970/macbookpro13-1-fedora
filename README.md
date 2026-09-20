@@ -749,11 +749,15 @@ Forked so the patches stay available regardless of upstream merge timing.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
    measuring with the module unloaded.
-5. **Suspend and hibernation with `facetimehd` loaded** — verify the AUR package's
-   warning about the module breaking suspend.
-6. **Hibernation image size** — 7.6 GB written to the NVMe on every lid close once
-   `HibernateDelaySec` elapses. Compression (`resumeflags`, or shrinking the swap
-   file) has not been looked at.
+5. **Suspend and hibernation with `facetimehd` loaded** — the AUR package warns the
+   module breaks suspend. Not reproduced: one 60-second `s2idle` cycle and one
+   hibernation cycle both resumed cleanly with the module loaded, and the camera
+   still streamed afterwards. Long cycles remain untested.
+6. **Hibernation image size** — measured once at 2.9 GB, written in 17.2 s at
+   174 MB/s (`PM: hibernation: Allocated 2991616 kbytes`). It scales with the memory
+   in use, so a busy session costs more, and every lid close pays it once
+   `HibernateDelaySec` elapses. Whether that write is worth shrinking has not been
+   looked at.
 7. **The PipeWire camera portal returns nothing** — worked around with
    `media.webrtc.camera.allow-pipewire=false`, but the cause is unknown. An
    `org.freedesktop.portal.Camera.AccessCamera` call hands back a request handle and
