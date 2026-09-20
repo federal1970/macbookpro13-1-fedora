@@ -34,7 +34,7 @@ section.
 | **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
-| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps |
+| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Works | Nothing to set; the earlier "very low level" note was wrong — see [open issues](#open-issues) |
 
@@ -771,25 +771,24 @@ media.webrtc.camera.allow-pipewire=false  ->  Capture Devices: 1
                                               GUM_OK: Apple Facetime HD
 ```
 
-> **This stopped reproducing on 2026-09-20.** With the pref back at its default
-> of `true` the camera works, so the workaround below is no longer needed and the
-> pref has been removed from the profile. Firefox is the same 156.0, so whatever
-> changed is underneath it. The stack as it stands, for comparison if this ever
-> comes back:
->
-> ```
-> firefox 156.0-1.fc44          pipewire    1.6.9-1.fc44
-> xdg-desktop-portal 1.22.1     wireplumber 0.5.17-1.fc44
-> xdg-desktop-portal-kde 6.7.5
-> ```
->
-> The portal was checked directly at the same time and answers correctly:
-> `AccessCamera` returns `Response 0` and `OpenPipeWireRemote` a valid fd. See
-> [open issues](#open-issues) for the three diagnoses of this that turned out to
-> be wrong.
+> **Still true as of 2026-09-20**, on firefox 156.0-1.fc44,
+> xdg-desktop-portal 1.22.1, pipewire 1.6.9, wireplumber 0.5.17. Everything
+> under Firefox was checked that day and behaves correctly — see
+> [open issues](#open-issues). Note that the pref only takes effect on a
+> restart; changing it in `about:config` and testing in the same session
+> measures the old value.
 
-**The workaround, if it returns:** in `about:config` set
-**`media.webrtc.camera.allow-pipewire`** to **`false`** and restart Firefox.
+**The fix:** set **`media.webrtc.camera.allow-pipewire`** to **`false`** and
+restart Firefox. Putting it in `user.js` rather than `about:config` applies it at
+every start and survives a `prefs.js` reset:
+
+```bash
+echo 'user_pref("media.webrtc.camera.allow-pipewire", false);' \
+  >> ~/.config/mozilla/firefox/*.default-release/user.js
+```
+
+Note the profile path: Firefox 156 keeps profiles under `~/.config/mozilla`, not
+`~/.mozilla`.
 
 To reproduce the diagnosis on your own machine, the camera engine will say how many
 devices it found:
@@ -979,40 +978,52 @@ Forked so the patches stay available regardless of upstream merge timing.
    *preallocation of the snapshot in RAM*, not a disk write — it is printed on
    every attempt, successful or not, and an earlier version of this file read it as
    proof of a working write.
-7. **Resolved: the camera works through PipeWire; the workaround is gone.**
-   `media.webrtc.camera.allow-pipewire` is back at its default of `true` and the
-   camera works in Firefox 156. Why it ever needed `false` is not recoverable —
-   the note recorded the symptom but not the date or the versions, and portal,
-   wireplumber and Firefox have all been updated since.
+7. **Firefox finds no camera over PipeWire — and everything beneath Firefox is
+   innocent.** The workaround stands. What was established on 2026-09-20, by
+   running the exact call sequence Firefox uses and a control alongside it:
 
-   The portal itself was exercised end to end on 2026-09-20 and behaves
-   correctly:
+   - **Firefox calls `OpenPipeWireRemote` but never `AccessCamera`.** With
+     `G_MESSAGES_DEBUG=all` on `xdg-desktop-portal.service`, a failing attempt
+     logs `Adding registered host app 'org.mozilla.firefox'` and nothing else;
+     the `Camera: sending response` line that an answered `AccessCamera` always
+     prints never appears. The client it creates is visible in `pw-dump` with
+     the properties only the portal sets: `access: portal`,
+     `app_id: org.mozilla.firefox`, `media_roles: Camera`.
+   - **That skip is legal and harmless.** `handle_open_pipewire_remote` in
+     `src/camera.c` checks only the permission store, where
+     `org.mozilla.firefox` is already `yes`, so the call succeeds.
+   - **And it makes no difference to permissions.** The portal deliberately
+     hides every node (`PW_PERMISSION_INIT (PW_ID_ANY, 0)`) and leaves the
+     granting to WirePlumber. Running both sequences by hand, with and without
+     `AccessCamera`, WirePlumber logs the same thing either way:
 
-   ```
-   AccessCamera       -> Response 0 (allowed)
-   OpenPipeWireRemote -> valid fd
-   ```
+     ```
+     find-portal-access.lua: Setting portal camera permissions to all
+     wp-permission-manager:  Updating permissions on client 68: any=rwxml
+     ```
 
-   Three things this entry used to claim, all wrong:
+   So the portal answers correctly, the permission store is right, WirePlumber
+   grants the camera, and the node is there (`wpctl status` shows
+   `Apple Facetime HD (V4L2)`). The fault is in Firefox's own PipeWire camera
+   path. The next step, if anyone wants it, is Firefox's side of the story:
+   `MOZ_LOG="CamerasChild:5,CamerasParent:5"`, as in
+   [section 6](#6-firefox-notfounderror-with-a-camera-that-works).
 
-   - *"An unsandboxed Firefox has an empty app ID, while the stored permission is
-     keyed to `org.mozilla.firefox`."* It is not empty. The portal derives it
-     from the process tree and logs
-     `Adding registered host app 'org.mozilla.firefox'`. A shell running under
-     Konsole gets `org.kde.konsole` the same way.
-   - *"`AccessCamera` hands back a request handle and then never sends a
-     `Response`."* It does. `gdbus call` exits as soon as it has the handle, so
-     nothing is left to receive the signal; a client that stays subscribed gets
-     it every time.
-   - *"`GTask ... finalized without ever returning` shows the portal drops the
-     task."* That warning is normal here.
-     `handle_access_camera_in_thread_func` in `src/camera.c` uses the task only
-     to reach a thread — no callback, no return value — and emits the response
-     before returning.
+   **Four diagnoses of this were wrong before the above, and three of them were
+   committed.** Worth keeping as a set, because each was convincing:
 
-   Also checked and normal: no installed backend implements
-   `org.freedesktop.impl.portal.Camera`, because the frontend has no such impl
-   interface and uses `Access` instead.
+   - *"An unsandboxed Firefox has an empty app ID."* It is not empty — the
+     portal derives it from the process tree and logs
+     `Adding registered host app 'org.mozilla.firefox'`. A shell under Konsole
+     gets `org.kde.konsole` the same way.
+   - *"`AccessCamera` never sends a `Response`."* It does. `gdbus call` exits as
+     soon as it has the request handle, leaving nothing to receive the signal.
+   - *"`GTask ... finalized without ever returning` — the portal drops the
+     task."* Normal here: the thread func has no callback and no return value,
+     and emits the response before returning.
+   - *"The camera works now, the workaround is obsolete."* Measured without
+     restarting Firefox, so the old pref value was still in force. The portal
+     log showing no camera activity at all was the tell, and it was ignored.
 
 8. **Resolved: hibernation works — and how four hours were spent proving it did
    not.** On 2026-09-20 this entry asserted that no image had ever been written.
