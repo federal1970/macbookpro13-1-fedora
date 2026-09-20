@@ -122,6 +122,28 @@ below before relying on suspend alone.
 
 ---
 
+### Hibernation costs nothing to hold
+
+Measured 2026-09-20 with the battery gauge, charger unplugged, over a 64 min 28 s
+hibernation (`tools/hib-battery-test.sh`):
+
+| state, over that hour | cost |
+|---|---|
+| **hibernated** | **nothing measurable** — the gauge read 26000 µAh *higher* afterwards |
+| `s2idle` | 4.12 Wh, about 8% of a full battery |
+| awake and idle | 8.80 Wh |
+
+The gauge reading rises because the "before" sample is taken under an ~8 W load,
+with the cell voltage sagging, and the "after" sample follows an hour at rest.
+`capacity` agrees: 77% before, 78% after. What matters is that the measurement
+noise, ±26000 µAh, is an order of magnitude smaller than the 335000 µAh `s2idle`
+would have drawn in the same window.
+
+What hibernation does cost is the transition — writing the image, the firmware
+boot and reading it back — measured separately at about **0.32 Wh**. Against
+`s2idle`'s 3.83 W that pays for itself after roughly five minutes with the lid
+shut, which is why the documented `HibernateDelaySec=15min` is comfortable.
+
 ### s2idle costs about 4.1 W
 
 Measured with the lid closed over 10 hours, from full charge down to 9%. Battery

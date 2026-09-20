@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # What does an hour of hibernation actually cost?
 #
-# Reads the battery coulomb counter, hibernates, and reads it again the moment
-# the machine comes back -- `systemctl hibernate` only returns after the resume,
-# and this script goes into the image along with its variables, so the second
-# reading needs no second invocation and is taken seconds after the restore.
+# Reads the battery gauge, hibernates, and reads it again once the machine is
+# back. The script itself goes into the image along with its variables, so the
+# second reading needs no second invocation.
+#
+# `systemctl hibernate` does NOT block until the resume -- it is a D-Bus call to
+# logind that returns at once, while the hibernation happens afterwards in
+# systemd-hibernate.service. Assuming otherwise produced a report reading
+# "off for 0 min 0 s" with both readings identical. So wait for the resume by
+# watching the kernel log instead.
 #
 # No root needed: the battery counters are world-readable.
 set -u
@@ -44,14 +49,28 @@ say "voltage    : $(awk -v v="$V0" 'BEGIN{printf "%.2f", v/1e6}') V"
 say "on AC      : no"
 say
 say "Hibernating now. Leave it off as long as you like -- an hour is plenty."
-say "Bring it back with the power button, enter the disk passphrase, and the"
-say "second reading is taken automatically within seconds of the restore."
+say "Bring it back with the power button and enter the disk passphrase; the"
+say "second reading and the report follow by themselves."
 say
 sync
 
+CURSOR=$(journalctl -k -n0 --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p')
 systemctl hibernate
 
+# Wait for the machine to come back, up to 24 h.
+for _ in $(seq 1 86400); do
+  journalctl -k --after-cursor="$CURSOR" --no-pager 2>/dev/null | grep -q 'hibernation exit' && break
+  sleep 1
+done
+sleep 2   # let the battery driver refresh after the resume
+
 C1=$(cat "$BAT/charge_now"); V1=$(cat "$BAT/voltage_now"); T1=$(date +%s)
+# The real off window, from the kernel rather than from wall clock arithmetic.
+T_IN=$(journalctl -k --after-cursor="$CURSOR" --no-pager -o short-unix 2>/dev/null \
+         | awk '/hibernation entry/ {print int($1); exit}')
+T_OUT=$(journalctl -k --after-cursor="$CURSOR" --no-pager -o short-unix 2>/dev/null \
+         | awk '/hibernation exit/ {print int($1); exit}')
+[ -n "${T_IN:-}" ] && [ -n "${T_OUT:-}" ] && { T0=$T_IN; T1=$T_OUT; }
 
 say "--- back at $(date '+%F %T') ---"
 say
@@ -59,7 +78,7 @@ awk -v c0="$C0" -v c1="$C1" -v v="$V0" -v t0="$T0" -v t1="$T1" -v tr="$TRANSITIO
 BEGIN{
   dt = t1 - t0
   wh = (c0-c1)/1e6 * v/1e6
-  printf "off for        : %d min %d s\n", dt/60, dt%60
+  printf "hibernated for : %d min %d s\n", dt/60, dt%60
   printf "charge         : %d -> %d uAh\n", c0, c1
   printf "energy used    : %.3f Wh total\n", wh
   printf "raw average    : %.2f W across the whole window\n\n", wh/(dt/3600)
