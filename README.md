@@ -34,7 +34,7 @@ section.
 | **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
 | **Hibernation** | **The real fix** | [Swap file on btrfs, `resume=`, sleep-then-hibernate](#hibernation--the-solution) |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
-| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + a kernel 7.2 source fix](#camera-facetime-hd) |
+| **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Partially working | Very low recording level — see [open issues](#open-issues) |
 
@@ -498,7 +498,52 @@ Why this specific change:
 - This was the *only* kernel 7.2 API breakage in the driver; nothing else needed
   touching.
 
-### 4. Build and verify
+### 4. Cheese freezes on the first frame
+
+With the driver built and loaded, Cheese shows one frame and then stops, while the
+hardware keeps streaming. The cause is timestamps, not the capture path.
+
+The vb2 queue advertises `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` (`fthd_v4l2.c:696`),
+promising every buffer a monotonic timestamp. But `fthd_buffer_return_handler()`
+hands buffers back through `vb2_buffer_done()` without ever setting `vb->timestamp`,
+so every frame carries a zero:
+
+```console
+$ ffmpeg -f v4l2 -video_size 1280x720 -i /dev/video0 -frames:v 4 -vf showinfo -f null -
+n:  0 pts: 0 pts_time:0
+n:  1 pts: 0 pts_time:0
+n:  2 pts: 0 pts_time:0
+n:  3 pts: 0 pts_time:0
+```
+
+That splits consumers in two. `ffmpeg` writing to a null muxer ignores timestamps
+and reports a healthy `frame=60 fps=30`, which is why the driver looks fine on the
+`-list_formats` check above. GStreamer — and therefore Cheese — schedules display
+*by* PTS, so after the first frame nothing is ever due, and the picture stands still.
+The same thing shows up in `ffmpeg` as soon as it writes a real file:
+`frame=2, drop=571` over 20 seconds.
+
+The fix is one line in `fthd_buffer_return_handler()`:
+
+```diff
+ 		if (ctx->state == BUF_HW_QUEUED || ctx->state == BUF_DRV_QUEUED) {
+ 			ctx->state = BUF_ALLOC;
++			ctx->vb->timestamp = ktime_get_ns();
+ 			vb2_buffer_done(ctx->vb, VB2_BUF_STATE_DONE);
+ 		}
+```
+
+`ktime_get_ns()` is exactly the monotonic clock the queue already promises, and no
+extra `#include` is needed — it arrives transitively via the videobuf2 headers.
+
+Available in [my fork](https://github.com/federal1970/facetimehd) as commit
+[`95cae61`](https://github.com/federal1970/facetimehd/commit/95cae61), submitted
+upstream as [juicecultus/facetimehd#2](https://github.com/juicecultus/facetimehd/pull/2).
+
+Frame `sequence` numbering is still unset; nothing here appeared to care, so it was
+left alone.
+
+### 5. Build and verify
 
 ```bash
 sudo dkms remove facetimehd/0.6.13 --all
@@ -519,6 +564,24 @@ Raw       : Unsupported :           YVYU 4:2:2 : {320-1280, 8}x{240-720, 2}
 
 (The `Error opening input file` line that follows is normal for `-list_formats`,
 not a failure.) For a live preview, `ffplay -f v4l2 -video_size 1280x720 /dev/video0`.
+
+**Check the timestamps too** — this is what tells a working camera apart from one
+that will freeze in Cheese. PTS must advance by about 33 ms per frame:
+
+```console
+$ ffmpeg -f v4l2 -video_size 1280x720 -i /dev/video0 -frames:v 4 -vf showinfo -f null -
+n:  0 pts:      0 pts_time:0
+n:  1 pts:  33144 pts_time:0.033144
+n:  2 pts:  66521 pts_time:0.066521
+n:  3 pts: 101653 pts_time:0.101653
+```
+
+And a GStreamer pipeline with `sync=true`, which honours those timestamps the way
+Cheese does, must finish rather than stall:
+
+```bash
+gst-launch-1.0 v4l2src device=/dev/video0 num-buffers=60 ! videoconvert ! fakesink sync=true
+```
 
 **A warning carried over from the AUR package** of the same driver: keeping the
 module permanently loaded may break suspend. Not reproduced here yet, but worth
@@ -619,7 +682,7 @@ Forked so the patches stay available regardless of upstream merge timing.
 
 | Fork | Upstream | Purpose |
 |---|---|---|
-| [federal1970/facetimehd](https://github.com/federal1970/facetimehd) | [juicecultus/facetimehd](https://github.com/juicecultus/facetimehd) | FaceTime HD driver, **includes the kernel 7.2 `strscpy` fix** |
+| [federal1970/facetimehd](https://github.com/federal1970/facetimehd) | [juicecultus/facetimehd](https://github.com/juicecultus/facetimehd) | FaceTime HD driver, **includes the kernel 7.2 `strscpy` fix and the buffer timestamp fix** |
 | [federal1970/facetimehd-firmware](https://github.com/federal1970/facetimehd-firmware) | [patjak/facetimehd-firmware](https://github.com/patjak/facetimehd-firmware) | Camera firmware extraction, used unmodified |
 | [federal1970/snd_hda_macbookpro](https://github.com/federal1970/snd_hda_macbookpro) | [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) | Cirrus CS8409 audio driver, used unmodified |
 
