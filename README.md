@@ -26,7 +26,7 @@ section.
 | Component | Status | What it takes |
 |---|---|---|
 | Graphics (Iris 540, i915) | Works out of the box | — |
-| Wi-Fi (BCM4350) | Works | [Harmless firmware errors](#wi-fi-bcm4350); no WPA3 on this chip, so it uses a [WPA2 SSID](#wpa3-is-out-of-reach-use-a-wpa2-ssid) |
+| Wi-Fi (BCM4350) | Works | [Harmless firmware errors](#wi-fi-bcm4350); [no WPA3 under Linux](#no-wpa3-under-linux--macos-does-it-on-the-same-hardware), so it uses a WPA2 SSID |
 | Bluetooth | Works out of the box | — |
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
@@ -811,10 +811,12 @@ Those files are optional; the driver continues with built-in values. The related
 `device may have limited channels available` warning means a reduced 5 GHz channel
 list.
 
-### WPA3 is out of reach; use a WPA2 SSID
+### No WPA3 under Linux — macOS does it on the same hardware
 
-The BCM4350 here cannot do WPA3, and no amount of configuration changes that.
-`iw list` prints the whole of what the driver offers:
+**This is a driver and firmware limit, not a limit of the silicon.** macOS on this
+very machine connects to a WPA2/WPA3 network without trouble. Under Linux the
+chip is driven by `brcmfmac` with the blob from `linux-firmware`, and that
+combination offers no WPA3 at all. `iw list` prints the whole of what it offers:
 
 ```
 Supported extended features:
@@ -824,12 +826,19 @@ Supported extended features:
 
 No `SAE_OFFLOAD`, and `Supported commands` has `connect` but neither
 `authenticate` nor `external_auth` — and those are the only two routes by which
-`brcmfmac` can do SAE. The firmware in use is dated November 2015; WPA3 was
-ratified in 2018. Protected management frames *are* supported (`CMAC` appears
-among the ciphers), so that side is fine.
+`brcmfmac` can do SAE. The blob is `brcm/brcmfmac4350c2-pcie`, which reports
+itself as `Nov 26 2015 ... version 7.35.180.133`; WPA3 was ratified in 2018.
+Protected management frames *are* supported (`CMAC` appears among the ciphers),
+so that side is fine.
 
-The arrangement here is a separate WPA2 SSID on the same router for this
-machine. It associates instantly and needs nothing special.
+Untried, and noted only because macOS proves the hardware is capable: Apple ships
+a far newer firmware for this chip than `linux-firmware` carries, and `brcmfmac`
+gains SAE when the firmware advertises it. Extracting the macOS blob is the
+obvious thing to attempt if WPA3 is ever actually needed here.
+
+The arrangement here is a separate WPA2 SSID on the same router, set up
+deliberately for this machine. It associates instantly and needs nothing
+special.
 
 > **KDE will create a WPA3-only profile for a mixed network.** If the SSID
 > advertises both `psk` and `sae`, the applet picks `sae`, and the connection
@@ -917,8 +926,10 @@ Forked so the patches stay available regardless of upstream merge timing.
    from is not recorded, so it may have predated the CS8409 driver being set up
    properly. Nothing to do.
 3. **Resolved: Wi-Fi on the main router.** Not a defect. That SSID is WPA3, and
-   this chip has no WPA3 — see [above](#wpa3-is-out-of-reach-use-a-wpa2-ssid). A
-   separate WPA2 SSID on the same router serves this machine.
+   `brcmfmac` with the stock firmware has no WPA3 — see
+   [above](#no-wpa3-under-linux--macos-does-it-on-the-same-hardware). A separate
+   WPA2 SSID on the same router serves this machine. macOS manages WPA3 on the
+   same hardware, so newer firmware may be all it would take; not attempted.
 4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
    permanently powered on; the 4.1 W idle drain may partly come from there. Worth
    measuring with the module unloaded.
