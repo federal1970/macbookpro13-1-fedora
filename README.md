@@ -943,9 +943,55 @@ Forked so the patches stay available regardless of upstream merge timing.
 
 ## Open issues
 
-1. **Package C-states never go below C3** — this is what makes S0ix, and therefore a
-   low-power `s2idle`, impossible. No `PNP0D80` ACPI device is exposed by the
-   firmware. Unclear whether anything on the OS side can change that.
+1. **Package C-states never go below C3 — measured, and not fixable from the OS
+   side.** This is what makes S0ix, and therefore a low-power `s2idle`,
+   impossible. `intel_pmc_core` exposes the whole picture in
+   `/sys/kernel/debug/pmc_core/` (root only):
+
+   ```
+   $ cat package_cstate_show
+   Package C2 : 445265455
+   Package C3 : 1633589593
+   Package C6 : 0        <- and C7 through C10 likewise
+   $ cat slp_s0_residency_usec
+   0
+   ```
+
+   `pch_ip_power_gating_status` names what stays powered:
+
+   | block | what is behind it |
+   |---|---|
+   | `XHCI` | the USB ports |
+   | `SPB` | the Thunderbolt root port (`00:1c.4`) |
+   | `SPC` | the Wi-Fi and camera root ports (`00:1d.0`, `00:1d.1`) |
+   | `LPSS`, `SPI` | the buses the keyboard and trackpad live on (`applespi`) |
+
+   `ltr_show` has exactly one block declaring a real latency requirement —
+   `SOUTHPORT_C`, 61 µs — which is those same Wi-Fi and camera ports.
+
+   Three explanations were tested and none survived:
+
+   - **`facetimehd`**, the out-of-tree camera driver. Unloaded: `SPC` stayed on,
+     C6 stayed zero.
+   - **`brcmfmac`**. Same.
+   - **Runtime PM disabled on the endpoints.** `00:02:00.0` and `00:03:00.0` sit
+     at `power/control=on`, so they never leave D0. Setting both to `auto`
+     changed nothing — the drivers hold a runtime PM reference and never
+     suspend. Unbinding them does not help either: a PCI device with no driver
+     stays in D0, so the root ports above it cannot suspend.
+
+   So it is not one misbehaving device. At least four blocks stay awake, and one
+   of them, `LPSS`/`SPI`, carries the keyboard and trackpad — it cannot be
+   powered down on a machine anyone is using. Fixing runtime PM for Wi-Fi and
+   the camera would still leave XHCI, Thunderbolt and SPI holding the package at
+   C3.
+
+   Above all that, the firmware gives the OS no way in: no `PNP0D80` device, so
+   nothing to call to enter S0ix, and part of the PMC is walled off —
+   `pll_status` answers `Access denied: please disable PMC_READ_DISABLE setting
+   in BIOS`, a setting no Mac has. **This is not a driver that someone could
+   write; it would take different firmware.** `s2idle` at 3.83 W is the floor
+   here, which is why hibernation is the answer instead.
 2. **Resolved: the microphone is fine.** This entry used to say the recording
    level was very low. It is not — a Telegram call came through normally, and the
    mixer needs nothing done to it: `Internal Mic Capture Volume` is already at
