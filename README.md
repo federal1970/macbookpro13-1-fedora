@@ -220,6 +220,31 @@ These are exactly the symptoms that make issue #207 recommend `s2idle`.
 
 ---
 
+### What the ACPI tables say — two sleep paths, Linux walks neither (2026-09-21)
+
+The tables are dumped and disassembled in [`acpi/`](acpi/README.md). The short
+version: the firmware classifies the OS once at boot through `_OSI`, and
+everything about sleep power branches on the answer.
+
+- **macOS path** (`_OSI("Darwin")`, which Linux answers by default): `_PTS` does
+  almost nothing. Power is cut in per-device `_PS3` methods and in Apple-private
+  methods that Apple's drivers call first — `NHI0.RTPC(0)` and `XHC2.RTPC(0)` to
+  release Thunderbolt, `SXFP`/`TRPE` to cut its power, `RP01._PS3` to cut the SSD's
+  two power GPIOs, `RP09._PS3` to power-gate Wi-Fi. Linux drivers call none of the
+  private ones, and the kernel never puts the Thunderbolt root port into D3 (it is
+  a native-hotplug port on x86), so Alpine Ridge stays powered through every sleep.
+- **Boot Camp path** (anything else): written for Windows drivers, so `_PTS(3)`
+  itself powers off Bluetooth and the camera and arms the EC, and `_WAK` restarts
+  the Thunderbolt firmware. Reachable with `acpi_osi=!Darwin`, which the kernel
+  documents as the workaround for the "power regressions on Mac laptops" that
+  answering Darwin introduced.
+
+So the 3.83 W and 5.30 W above were measured with Thunderbolt, camera and
+Bluetooth powered and nobody asking the firmware to switch them off. That is not
+firmware that needs reverse-engineering — the methods exist, are named, and can be
+called from the OS. The experiments, cheapest first, are listed at the end of
+[`acpi/README.md`](acpi/README.md); none has been run yet.
+
 ### Hibernation — the intended solution
 
 > **This works.** A full cycle was confirmed on 2026-09-20: about 894 MB written,
@@ -1011,9 +1036,14 @@ Forked so the patches stay available regardless of upstream merge timing.
    Above all that, the firmware gives the OS no way in: no `PNP0D80` device, so
    nothing to call to enter S0ix, and part of the PMC is walled off —
    `pll_status` answers `Access denied: please disable PMC_READ_DISABLE setting
-   in BIOS`, a setting no Mac has. **This is not a driver that someone could
-   write; it would take different firmware.** `s2idle` at 3.83 W is the floor
-   here, which is why hibernation is the answer instead.
+   in BIOS`, a setting no Mac has. S0ix itself is out of reach — and macOS never
+   used it either: Intel Macs sleep in S3. What *is* reachable is the S3 and
+   s2idle drain, because the devices that stay powered (Thunderbolt, camera,
+   Bluetooth, possibly the SSD and Wi-Fi) have firmware power-off methods that
+   Linux simply never calls — see
+   [the ACPI chapter](#what-the-acpi-tables-say--two-sleep-paths-linux-walks-neither-2026-09-21).
+   Until those experiments are run, `s2idle` at 3.83 W is the measured floor,
+   which is why hibernation is the answer for now.
 2. **Resolved: the microphone is fine.** This entry used to say the recording
    level was very low. It is not — a Telegram call came through normally, and the
    mixer needs nothing done to it: `Internal Mic Capture Volume` is already at
