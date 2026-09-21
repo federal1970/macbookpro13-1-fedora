@@ -31,7 +31,7 @@ section.
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
-| **Suspend / resume** | **Works, drains ~4.1 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); S0ix is out of reach on this machine |
+| **Suspend / resume** | **Works, `deep` (S3) drains 1.37 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
@@ -54,10 +54,14 @@ backlight, NVMe storage, battery reporting, and USB-C.
 ## Sleep and hibernation
 
 Suspend itself works — wake is instant and everything comes back. The problem is
-power: `s2idle` on this machine drains the battery at roughly the rate of a running
-system. The arrangement that solves it is **suspend-then-hibernate**: s2idle for short
-breaks, hibernation after 15 minutes. Both halves work — the hibernate half took
-a while to believe, for reasons kept in [open issues](#open-issues).
+power: `s2idle` on this machine drains the battery at about half the rate of a
+running system, some 4 W. `deep` (ACPI S3) measures **1.37 W** with the right
+wakeup sources disarmed — a full battery lasts a day and a half instead of half
+a day — and has been the default sleep since 2026-09-21. On battery the lid still
+asks for **suspend-then-hibernate**, so a lid shut for longer than 15 minutes
+ends in hibernation, which costs nothing to hold. Both halves work — the hibernate
+half took a while to believe, and `deep` was written off for a day on a bad
+measurement; both stories are in [open issues](#open-issues).
 
 The suspend part is based on
 [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
@@ -66,8 +70,15 @@ The suspend part is based on
 ### 1. Kernel parameters
 
 ```bash
-sudo grubby --update-kernel=ALL --args="button.lid_init_state=open nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1 pci=noaer i915.enable_fbc=0 mem_sleep_default=s2idle"
+sudo grubby --update-kernel=ALL --args="button.lid_init_state=open nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1 pci=noaer i915.enable_fbc=0 mem_sleep_default=deep"
 ```
+
+`mem_sleep_default=deep` selects S3. Issue #207 and every earlier revision of this
+file used `s2idle`, for reasons that turned out to be a broken measurement — see
+[`deep` costs 1.37 W](#deep-costs-137-w--three-times-less-than-s2idle-2026-09-21).
+Switching an installed system: `--remove-args="mem_sleep_default=s2idle"
+--args="mem_sleep_default=deep"` in one `grubby` call, and `echo deep | sudo tee
+/sys/power/mem_sleep` takes effect without a reboot.
 
 `i915.enable_dc=0` and `i915.enable_psr=0` were part of the original recipe and have
 since been dropped: removing them changed nothing about the drain, and suspend works
@@ -80,7 +91,10 @@ fine without them.
 ```bash
 #!/usr/bin/env bash
 find /sys/devices/ -name d3cold_allowed -exec sh -c 'echo 0 > "$1" 2>/dev/null' _ {} \;
-for device in LID0 XHC1 ARPT RP01 RP09 RP10; do
+# RP05 XHC2 SPIT were added on 2026-09-21 for deep (S3): the test that measured
+# 1.37 W had them disarmed. SPIT is the keyboard and trackpad, so from deep only
+# the power button (and the RTC) wake the machine.
+for device in LID0 XHC1 ARPT RP01 RP09 RP10 RP05 XHC2 SPIT; do
   if grep -q "$device.*enabled" /proc/acpi/wakeup; then
     echo "$device" > /proc/acpi/wakeup
   fi
@@ -90,6 +104,15 @@ done
 ```bash
 sudo chmod +x /usr/local/bin/mbp-suspend-fix.sh
 ```
+
+The first six are issue #207's list. `RP05` is the Thunderbolt root port, `XHC2`
+the xHCI controller inside the Alpine Ridge chip, `SPIT` the SPI topcase — the
+keyboard and trackpad. All three were still armed when `deep` "woke itself after
+10 seconds"; the 1.37 W run had them off and slept its full 30 minutes. Which of
+the three was the spurious wake has not been isolated. The price is that a key
+press no longer wakes the machine from `deep`; the power button does. Whether
+opening the lid does, with `LID0` disarmed as well, is part of the first check
+in step 4 — the 1.37 W run was woken by the RTC and says nothing about it.
 
 ### 3. systemd unit
 
@@ -114,11 +137,21 @@ sudo systemctl enable mbp-suspend-fix.service
 ### 4. Verify
 
 ```bash
-cat /sys/power/mem_sleep      # expected: [s2idle] deep
+cat /sys/power/mem_sleep      # expected: s2idle [deep]
+grep -v disabled /proc/acpi/wakeup   # expected: only the header line
 ```
 
-**Result:** instant wake, USB and Wi-Fi alive afterwards — but see the drain figure
-below before relying on suspend alone.
+Then the first real cycle: close the lid, wait a minute, open it. If the lid
+does not bring it back, the power button does. Afterwards make sure it really
+was S3 and not a dry run:
+
+```bash
+journalctl -k -b | grep -E 'sleep state S3|suspend debug'
+cat /sys/power/pm_test        # must be [none]
+```
+
+**Result:** USB and Wi-Fi are back after the wake — Wi-Fi because the [sleep hook](#3-wi-fi-after-deep-and-after-hibernation)
+reloads `brcmfmac`, which loses its firmware when the rails go down in S3.
 
 ---
 
@@ -206,17 +239,54 @@ sudo grubby --update-kernel=ALL --args="nvme_core.default_ps_max_latency_us=0"
 sudo systemctl enable mbp-suspend-fix.service
 ```
 
-### Why not `deep`
+### `deep` costs 1.37 W — three times less than s2idle (2026-09-21)
 
-`echo deep | sudo tee /sys/power/mem_sleep` fails in two ways:
+Measured with `tools/deep-test.sh`: charger unplugged, `brcmfmac` unloaded,
+`RP05 XHC2 SPIT ARPT` disarmed on top of the boot script's list, `thunderbolt`
+blacklisted, an RTC alarm at 30 minutes as the safety net
+(`sudo MEM_SLEEP=deep SLEEP_SECS=1800 REPORT=/var/tmp/osi-deep.txt tools/deep-test.sh`).
+The s2idle control ran the same way a few minutes earlier.
 
-- The machine wakes itself about 10 seconds after going to sleep.
-- After that wake Wi-Fi is dead, and neither reloading the driver nor a `reboot`
-  brings it back — only a full power cycle does.
-- The spurious wake cannot be traced: `/sys/power/pm_wakeup_irq` is empty, meaning
-  the wakeup arrives over an ACPI GPE rather than an ordinary interrupt.
+| state | drain | a full battery (46 Wh) lasts |
+|---|---|---|
+| awake, idle | ~8.2 W | ~6 h |
+| `s2idle` | 3.83 W (Sep 20, 30 min) / 4.01 W (Sep 21, 12.5 min) | ~12 h |
+| **`deep` (S3)** | **1.37 W** | **~36 h** |
 
-These are exactly the symptoms that make issue #207 recommend `s2idle`.
+What makes the number believable, in the order the earlier attempt got wrong:
+the kernel log has `ACPI: PM: Preparing to enter system sleep state S3` and
+`Waking up from system sleep state S3` for that window, `pm_test` was `[none]`,
+the machine slept the full 1801 s and was woken by the RTC (`PNP0B00:00` is the
+only wakeup source that fired), and the gauge moved 55 mAh in 1 mAh steps, which
+is good to a few percent. The battery cooled from 34.1 to 28.8 °C.
+
+**Everything this file used to say against `deep` was a measurement error.** The
+2026-09-20 attempt reported 5.30 W and "wakes itself after 10 seconds"; it left
+no report file and nobody checked the log for the S3 line, so it most likely
+never entered S3 at all, or woke at once. The two symptoms it described were
+real but were configuration, not hardware:
+
+- the wake after 10 seconds came from one of `RP05`, `XHC2`, `SPIT`, which the
+  original issue #207 list leaves armed. `/sys/power/pm_wakeup_irq` is empty for
+  all three because they wake over ACPI GPEs, not an ordinary interrupt;
+- "Wi-Fi dead until a power cycle" is the BCM4350 losing its firmware when the
+  rails go down in S3, the same thing that happens in hibernation, and the same
+  hook cures it. With the module unloaded before sleep and reloaded after, Wi-Fi
+  reconnected on every S3 cycle.
+
+Two side effects of S3 that look alarming in the log and are not: `xhci_hcd
+0000:07:00.0: xHC error in resume, USBSTS 0x401, Reinit` (the Alpine Ridge
+xHCI lost power and is reinitialised) and one `applespi ... Received corrupted
+packet (crc mismatch)` on resume.
+
+One thing that is *not* an S3 problem, noticed during the s2idle control: the
+keyboard backlight stays lit through `s2idle`. That is by design in `applespi` —
+its suspend handler turns off only the caps-lock LED, and the backlight has no
+`LED_CORE_SUSPENDRESUME` flag — so at any nonzero level it burns for the whole
+of s2idle. In S3 the rail is cut and it cannot matter.
+
+Still 3-4 times what macOS draws in the same S3 (0.3-0.5 W); where the rest goes
+is the subject of the next chapter.
 
 ---
 
@@ -244,8 +314,9 @@ everything about sleep power branches on the answer.
   changes are in [`acpi/README.md`](acpi/README.md). The Boot Camp path is
   closed; what it would have switched off has to be called by hand instead.
 
-So the 3.83 W and 5.30 W above were measured with Thunderbolt, camera and
-Bluetooth powered and nobody asking the firmware to switch them off. That is not
+So the 4 W of s2idle and the 1.37 W of `deep` above were measured with
+Thunderbolt, camera and Bluetooth powered and nobody asking the firmware to
+switch them off. That is not
 firmware that needs reverse-engineering — the methods exist, are named, and can be
 called from the OS. The experiments, cheapest first, are listed at the end of
 [`acpi/README.md`](acpi/README.md); the first one (`acpi_osi=!Darwin`) has been
@@ -332,28 +403,47 @@ the image, so the passphrase is asked for at power-on as usual.
 **The offset belongs to that one file.** Recreate the swap file and you have to
 recompute `resume_offset`.
 
-#### 3. Wi-Fi after hibernation
+#### 3. Wi-Fi after `deep` and after hibernation
 
-The same problem as with `deep` comes back: hibernation cuts power to the BCM4350,
-the kernel restores its own state from the image and assumes the chip is still
-initialised. The cure is to unload the driver *before* hibernating, so the chip is
-shut down properly and brought up from scratch afterwards.
+Both cut power to the BCM4350. The kernel restores its own state — from RAM
+after S3, from the image after hibernation — and assumes the chip is still
+initialised; it is not, and the driver never recovers. The cure is to unload
+the driver *before* sleeping, so the chip is shut down properly and brought up
+from scratch afterwards. The hook acts on the suspend phase and on the
+hibernate phase; with `s2idle` it was hibernate only.
 
 `/usr/lib/systemd/system-sleep/brcmfmac-reload`:
 
 ```bash
 #!/usr/bin/env bash
-# Only the hibernate phase may be touched — see the warning below.
+# BCM4350 loses power in S3 (deep) and in hibernation and does not come back on
+# its own: unload brcmfmac before, load it again after.
+#
+# MUST live in /usr/lib/systemd/system-sleep/ -- systemd-sleep reads that
+# directory and only that one; /etc/systemd/system-sleep/ is never scanned.
+#
+# The phase is read from SYSTEMD_SLEEP_ACTION, never from "$2": during
+# suspend-then-hibernate the second argument stays "suspend-then-hibernate" for
+# both phases. Because this hook now acts on the suspend phase too, a timer wake
+# runs post/suspend and then pre/hibernate a few hundred ms apart: the module is
+# loaded, NetworkManager started, and both have to be undone again while the
+# chip is still taking its firmware. That is where "Module brcmfmac is in use"
+# used to come from, and why the unload is retried instead of attempted once.
+
 case "$SYSTEMD_SLEEP_ACTION" in
-  hibernate) ;;
+  suspend|hibernate|suspend-after-failed-hibernate) ;;
   *) exit 0 ;;
 esac
 
 case "$1" in
   pre)
     systemctl stop NetworkManager
-    modprobe -r brcmfmac_wcc 2>/dev/null
-    modprobe -r brcmfmac
+    for _ in $(seq 30); do
+      modprobe -r brcmfmac_wcc 2>/dev/null
+      modprobe -r brcmfmac 2>/dev/null && exit 0
+      sleep 0.5
+    done
+    echo "brcmfmac-reload: could not unload brcmfmac, sleeping with it loaded" >&2
     ;;
   post)
     modprobe brcmfmac
@@ -379,15 +469,19 @@ sudo chmod +x /usr/lib/systemd/system-sleep/brcmfmac-reload
 > Nor does a package update wipe it: rpm owns the directory (via `systemd-udev`)
 > but no file inside it, so a foreign file there survives.
 
-Verified: with the hook in the right place, `SYSTEMD_SLEEP_ACTION=hibernate`
-matches, the module is unloaded before the image stage and reloaded afterwards,
-and Wi-Fi reconnects by itself. To confirm it ran at all, have it append to a log
-and `sync` — the snippet is in [open issues](#open-issues).
+Verified for hibernation: with the hook in the right place,
+`SYSTEMD_SLEEP_ACTION=hibernate` matches, the module is unloaded before the image
+stage and reloaded afterwards, and Wi-Fi reconnects by itself. To confirm it ran
+at all, have it append to a log and `sync` — the snippet is in
+[open issues](#open-issues). The suspend-phase half is what `tools/deep-test.sh`
+does by hand around every `deep` run, and Wi-Fi came back after each of them.
 
-> **Do not match on `"$1/$2"` here.** The obvious version of this hook —
-> `case "$1/$2" in pre/*) ... post/*) ...` — hangs the machine on
-> `suspend-then-hibernate`, and the failure looks like a resume problem rather
-> than a hook problem.
+> **Do not match on `"$1/$2"` here, and do not drop the retry loop.** The
+> obvious version of this hook — `case "$1/$2" in pre/*) ... post/*) ...` —
+> hangs the machine on `suspend-then-hibernate`, and the failure looks like a
+> resume problem rather than a hook problem. The hook above acts on the suspend
+> phase deliberately, so the same sequence of events now happens on every timer
+> wake; the retry loop is what turns it from a hang into a one-second delay.
 >
 > `systemd-sleep` runs the hook around *each* phase, but the second argument
 > stays `suspend-then-hibernate` for both of them; the phase is only readable
@@ -417,8 +511,9 @@ and `sync` — the snippet is in [open issues](#open-issues).
 > unloaded the module at all. It was never `resume_offset`, where nothing is
 > wrong.
 
-If this ever stops being enough, the next step is to power down the PCIe device
-itself via `remove` in sysfs before hibernating and `rescan` after.
+If the retry loop ever runs out (the journal will show `could not unload
+brcmfmac`), the next step is to power down the PCIe device itself via `remove` in
+sysfs before sleeping and `rescan` after.
 
 #### 4. Automatic sleep → hibernate
 
@@ -484,13 +579,15 @@ minutes it spent powered down cost nothing: 3.92 Wh went in 40 minutes, against
 > where the lid stayed shut until 18:14. It reads as though someone interrupted
 > the test. Both lid tests on 2026-09-20 produced it, exactly at the alarm.
 
-On choosing the interval: at 3.83 W every 15 minutes of waiting costs about
-0.96 Wh, roughly 2% of the charge; 5 minutes would cost 0.7%. Against that, one
-hibernate-and-return transition costs about 0.32 Wh, so the delay pays for itself
-after some five minutes with the lid shut. The other argument for not making it
-very short is wear: about 894 MB of compressed image written to the NVMe every
-time the lid closes for real. The point of the delay is that short breaks — step
-away and come back — cost neither.
+On choosing the interval, with `deep` at 1.37 W: 15 minutes of waiting costs
+about 0.34 Wh, under 1% of the charge, and one hibernate-and-return transition
+costs about 0.32 Wh — so the delay only starts paying for itself after some
+14 minutes with the lid shut, and 15 minutes is now the shortest sensible
+setting rather than a comfortable one. (Under `s2idle` at 3.83 W the same
+15 minutes cost 0.96 Wh and break-even was five minutes.) A longer delay, an
+hour say, would spare the NVMe the 894 MB image on every real lid close and
+cost 1.4 Wh of waiting; it has not been changed yet. The point of the delay is
+that short breaks — step away and come back — cost neither.
 
 ### Battery data
 
@@ -1048,8 +1145,9 @@ Forked so the patches stay available regardless of upstream merge timing.
    Bluetooth, possibly the SSD and Wi-Fi) have firmware power-off methods that
    Linux simply never calls — see
    [the ACPI chapter](#what-the-acpi-tables-say--two-sleep-paths-linux-walks-neither-2026-09-21).
-   Until those experiments are run, `s2idle` at 3.83 W is the measured floor,
-   which is why hibernation is the answer for now.
+   Until those experiments are run, `deep` at 1.37 W is the measured floor and
+   has been the default sleep since 2026-09-21; hibernation stays as the
+   backstop on battery.
 2. **Resolved: the microphone is fine.** This entry used to say the recording
    level was very low. It is not — a Telegram call came through normally, and the
    mixer needs nothing done to it: `Internal Mic Capture Volume` is already at
@@ -1240,7 +1338,10 @@ Forked so the patches stay available regardless of upstream merge timing.
 
     Both cured by commit `e3859cb`: filter on `SYSTEMD_SLEEP_ACTION`, keep the
     file in `/usr/lib`. The listing in
-    [Wi-Fi after hibernation](#3-wi-fi-after-hibernation) is the fixed version.
+    [Wi-Fi after `deep` and after hibernation](#3-wi-fi-after-deep-and-after-hibernation)
+    is the fixed version, extended on 2026-09-21 to the suspend phase (needed for
+    `deep`) with a retry around the unload, because acting on the suspend phase
+    brings back exactly the post-then-pre sequence above on every timer wake.
     Everything documented in issue 8 was measured *after* this fix and therefore
     described a machine that already worked.
 
