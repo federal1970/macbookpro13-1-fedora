@@ -59,7 +59,7 @@ running system, some 4 W. `deep` (ACPI S3) measures **1.37 W** with the right
 wakeup sources disarmed — a full battery lasts a day and a half instead of half
 a day — and has been the default sleep since 2026-09-21. On battery the lid still
 asks for **suspend-then-hibernate**, so a lid shut for longer than 15 minutes
-ends in hibernation, which costs nothing to hold. Both halves work — the hibernate
+ends in hibernation, which costs next to nothing to hold. Both halves work — the hibernate
 half took a while to believe, and `deep` was written off for a day on a bad
 measurement; both stories are in [open issues](#open-issues).
 
@@ -165,7 +165,7 @@ reloads `brcmfmac`, which loses its firmware when the rails go down in S3.
 
 ---
 
-### Hibernation costs nothing to hold
+### Hibernation costs next to nothing to hold — once it really powers off
 
 Measured 2026-09-20 with the battery gauge, charger unplugged, over a 64 min 28 s
 hibernation (`tools/hib-battery-test.sh`):
@@ -178,9 +178,27 @@ hibernation (`tools/hib-battery-test.sh`):
 
 The gauge reading rises because the "before" sample is taken under an ~8 W load,
 with the cell voltage sagging, and the "after" sample follows an hour at rest.
-`capacity` agrees: 77% before, 78% after. What matters is that the measurement
-noise, ±26000 µAh, is an order of magnitude smaller than the 335000 µAh `s2idle`
-would have drawn in the same window.
+`capacity` agrees: 77% before, 78% after. What that measurement proves is a
+bound, not a zero: the noise, ±26000 µAh, is about 0.3 Wh, so anything under
+roughly 0.3 W hides in it. `s2idle` would have drawn 335000 µAh in the same
+window.
+
+**The firmware's S4 is not off.** With the default `HibernateMode=platform`
+the kernel writes the image and then asks the firmware for ACPI S4 — and in
+Apple's S4 the Force Touch trackpad still clicks. After `systemctl poweroff` it
+does not. So the topcase rail (keyboard and trackpad, the same SPI device) stays
+up in S4, and whatever else Apple leaves powered with it is unknown; the
+one-hour measurement above was taken in that state and could not see it. The
+journal is no help here: it records the state that was *requested*. The
+trackpad is the instrument.
+
+The fix is to have the kernel power the machine off itself after writing the
+image, instead of asking the firmware for S4 — `HibernateMode=shutdown` in
+`/etc/systemd/sleep.conf`, listed [below](#4-automatic-sleep--hibernate).
+Resume is unchanged: the initramfs finds the image at `resume_offset` on the
+next boot exactly as before. Verified 2026-09-21 22:33: image written, machine
+off, trackpad dead, power key, passphrase, session restored with Wi-Fi. An
+overnight `charge_now` comparison in this mode is still to be done.
 
 What hibernation does cost is the transition — writing the image, the firmware
 boot and reading it back — measured separately at about **0.32 Wh**. Against
@@ -335,8 +353,9 @@ run and is out, the rest have not.
 ### Hibernation — the intended solution
 
 > **This works.** A full cycle was confirmed on 2026-09-20: about 894 MB written,
-> power cut, the passphrase asked for at the next power-on, and the session
-> restored. Earlier revisions of this file said the opposite; how that mistake was
+> the passphrase asked for at the next power-on, and the session restored. What
+> "power cut" meant took another day to get right — see
+> [above](#hibernation-costs-next-to-nothing-to-hold--once-it-really-powers-off). Earlier revisions of this file said the opposite; how that mistake was
 > made, and how to avoid repeating it, is in [open issues](#open-issues).
 
 S4 is advertised by the firmware. The disk here is btrfs on LUKS with 213 GB free,
@@ -541,12 +560,18 @@ sysfs before sleeping and `rescan` after.
 Two things have to line up: the lid has to ask for `suspend-then-hibernate`
 rather than a plain suspend, and the delay before the second phase has to be set.
 
-**The delay** — `/etc/systemd/sleep.conf`:
+**The delay, and the power-off** — `/etc/systemd/sleep.conf`:
 
 ```
 [Sleep]
 HibernateDelaySec=15min
+HibernateMode=shutdown
 ```
+
+`HibernateMode=shutdown` makes the kernel power off after writing the image
+rather than request ACPI S4 from the firmware, which on this Mac leaves the
+topcase powered. `/sys/power/disk` shows `[shutdown]` after the first
+hibernation with it.
 
 Nothing needs restarting: `systemd-sleep` reads its configuration at the moment
 of going to sleep. A drop-in in `/etc/systemd/sleep.conf.d/` overrides this file,
