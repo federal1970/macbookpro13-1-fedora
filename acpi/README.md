@@ -113,8 +113,10 @@ nobody calling the methods that would cut them. None of that is firmware that
 needs reverse-engineering: the methods are here, named, and callable from the OS.
 The experiments, in order of cost:
 
-1. `acpi_osi=!Darwin` on the kernel command line — the whole Boot Camp path in one
-   reversible switch. Re-measure s2idle and `deep`.
+1. ~~`acpi_osi=!Darwin` on the kernel command line — the whole Boot Camp path in one
+   reversible switch.~~ **Tried 2026-09-21, unbootable: no keyboard at the LUKS
+   prompt.** See the next section. The Boot Camp path is closed as a whole; its
+   pieces are item 4.
 2. `NHI0.SXFP(0)` before suspend (Thunderbolt module unloaded) — via `acpi_call` or
    a five-line extension of `quirk_apple_poweroff_thunderbolt` to Alpine Ridge
    (`8086:1578`). For `deep`, firmware restores power; for s2idle, `TRPE(1, 500)`
@@ -123,5 +125,38 @@ The experiments, in order of cost:
    `echo 'file drivers/acpi/device_pm.c +p' > /sys/kernel/debug/dynamic_debug/control`
    and `echo 1 > /sys/power/pm_debug_messages`, then read `journalctl -k` after
    resume. Settles the `RP01`/`RP09` question without guessing.
-4. Camera and Bluetooth off by hand (`CMPE(0)`, `BTPD()`) if item 1 is rejected
-   for other reasons.
+4. Camera and Bluetooth off by hand (`CMPE(0)`, `BTPD()`) before suspend — the
+   only way left to get what the Boot Camp `_PTS(3)` does, now that item 1 is out.
+
+## `acpi_osi=!Darwin` — tested, the keyboard goes with it (2026-09-21)
+
+Booted once with `acpi_osi=!Darwin`. The kernel came up, `plymouth` asked for the
+LUKS passphrase, and the built-in keyboard was dead. The trackpad shares the same
+device, so there is nothing to type with; power-button reboot, argument removed
+(`grubby --remove-args`), back on the Darwin path. No journal exists for that boot
+because the root filesystem was never unlocked.
+
+The tables explain it. The keyboard and trackpad are `SPI1.SPIT` (`APP000D`,
+`apple-spi-topcase`), and both the controller and the device describe themselves
+differently to a non-Darwin OS:
+
+| | Darwin path | Boot Camp path (`!OSDW()`) |
+|---|---|---|
+| `SPI1._CRS` (controller) | IRQ 23 (level, active-low, shared) + two GPIO descriptors (`DBUF`) | empty |
+| `SPIT._CRS` (device) | empty | a `SpiSerialBusV2` descriptor on `\_SB.PCI0.SPI1` + IRQ 14 |
+| `SPIT._DSM` Apple properties (`spiSclkPeriod`, `spiWordSize`, `spiBitOrder`, `spiSPO`, `spiSPH`, `spiCSDelay`, ...) | returned | not returned (`If (OSDW ())` around the whole package) |
+
+Linux only implements the first column. The SPI core builds the slave device from
+the Apple properties (`acpi_spi_parse_apple_properties()` in `drivers/spi/spi.c`,
+gated on `x86_apple_machine`), and `applespi` takes its interrupt from `_GPE`
+(0x17) with `acpi_install_gpe_handler()`, not from a `_CRS` interrupt. Which of the
+two missing pieces kills it first was not investigated — the passphrase prompt is
+before any of that can be debugged, and both are missing. Everything else the
+Boot Camp path changes (backlight, EC, Thunderbolt restart in `_WAK`) never got a
+chance to matter.
+
+So the kernel's own advice for "power regressions on Mac laptops" does not apply
+to a Mac whose keyboard is on SPI: on this machine `acpi_osi=!Darwin` is not a
+sleep experiment, it is a brick until the argument is edited out of the GRUB
+line. The Boot Camp `_PTS(3)` savings — Bluetooth off (`BTPD`), camera off
+(`CMPE(0)`) — have to be taken piecemeal from the Darwin path (item 4 above).

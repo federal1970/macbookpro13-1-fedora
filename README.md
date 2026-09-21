@@ -237,13 +237,19 @@ everything about sleep power branches on the answer.
   itself powers off Bluetooth and the camera and arms the EC, and `_WAK` restarts
   the Thunderbolt firmware. Reachable with `acpi_osi=!Darwin`, which the kernel
   documents as the workaround for the "power regressions on Mac laptops" that
-  answering Darwin introduced.
+  answering Darwin introduced. **Tried 2026-09-21: unbootable.** On this path the
+  tables describe the SPI keyboard and trackpad in a shape Linux does not
+  implement (no Apple SPI properties, interrupt moved off the GPE), so the LUKS
+  passphrase prompt comes up with a dead keyboard. Details and the table of what
+  changes are in [`acpi/README.md`](acpi/README.md). The Boot Camp path is
+  closed; what it would have switched off has to be called by hand instead.
 
 So the 3.83 W and 5.30 W above were measured with Thunderbolt, camera and
 Bluetooth powered and nobody asking the firmware to switch them off. That is not
 firmware that needs reverse-engineering — the methods exist, are named, and can be
 called from the OS. The experiments, cheapest first, are listed at the end of
-[`acpi/README.md`](acpi/README.md); none has been run yet.
+[`acpi/README.md`](acpi/README.md); the first one (`acpi_osi=!Darwin`) has been
+run and is out, the rest have not.
 
 ### Hibernation — the intended solution
 
