@@ -121,8 +121,9 @@ writes the EC's `EWLO` bit ("wake on lid open"), and the kernel evaluates `_PSW`
 only for an armed wakeup source, so with `LID0` disabled the EC is never told to
 wake anybody. Under `s2idle` that never mattered, because the EC stays alive and
 its SCI wakes the kernel regardless. Armed, the lid woke the machine from S3 on
-the first try and caused no spurious wake in a two-minute cycle; whether it
-stays quiet over a night is the remaining check.
+the first try and caused no spurious wake in any of the six S3 cycles that
+evening (two to seven minutes each); whether it stays quiet over a night is
+the remaining check.
 
 ### 3. systemd unit
 
@@ -592,6 +593,16 @@ hibernated at 18:08:42 with the lid still down, and the next power-on asked for
 the passphrase and restored the session. Measured against the battery, the seven
 minutes it spent powered down cost nothing: 3.92 Wh went in 40 minutes, against
 3.80 Wh predicted by the awake and s2idle rates plus one transition.
+
+**Verified again under `deep` with the extended hook, 2026-09-21.** Two runs
+with a `HibernateDelaySec=2min` drop-in, on battery. Hands off, lid open:
+`suspend-then-hibernate` at 22:15:00, real S3, the RTC alarm woke it at
+22:16:59, the hook reloaded `brcmfmac` and started NetworkManager, then stopped
+it and unloaded the module again within two seconds (no `could not unload`),
+hibernation at 22:17:03, resumed by the power button five minutes later with
+Wi-Fi up. The lid-shut run before it did the same, except that the lid was
+opened at six minutes: systemd found the delay already elapsed and hibernated
+anyway, which is its documented behaviour, not a fault.
 
 > **`Lid opened` in the journal at exactly the delay is a lie.** On the way out
 > of s2idle `logind` re-reads the lid switch and reports it open even when it is
