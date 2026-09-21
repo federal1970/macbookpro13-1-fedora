@@ -438,19 +438,30 @@ esac
 case "$1" in
   pre)
     systemctl stop NetworkManager
+    unloaded=0
     for _ in $(seq 30); do
       modprobe -r brcmfmac_wcc 2>/dev/null
-      modprobe -r brcmfmac 2>/dev/null && exit 0
+      modprobe -r brcmfmac 2>/dev/null && { unloaded=1; break; }
       sleep 0.5
     done
-    echo "brcmfmac-reload: could not unload brcmfmac, sleeping with it loaded" >&2
+    [ "$unloaded" = 1 ] || echo "brcmfmac-reload: could not unload brcmfmac, sleeping with it loaded" >&2
+    # loading brcmfmac re-arms ARPT as a wakeup source; disarm it again before sleeping
+    /usr/local/bin/mbp-suspend-fix.sh
     ;;
   post)
     modprobe brcmfmac
     systemctl start NetworkManager
+    /usr/local/bin/mbp-suspend-fix.sh
     ;;
 esac
 ```
+
+The two calls to the boot-time script are not decoration. Loading `brcmfmac`
+sets `power/wakeup` on the BCM4350's PCI device to `enabled`, which is the same
+thing as `ARPT` showing `*enabled` in `/proc/acpi/wakeup` — the boot script's
+disarming is undone by every reload, and the PCI core arms that wake for S3 even
+with no driver bound. Seen on the very first `deep` cycle after the switch
+(2026-09-21 21:40): `ARPT` was the one source armed afterwards.
 
 ```bash
 sudo chmod +x /usr/lib/systemd/system-sleep/brcmfmac-reload
