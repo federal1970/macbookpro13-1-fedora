@@ -92,9 +92,10 @@ fine without them.
 #!/usr/bin/env bash
 find /sys/devices/ -name d3cold_allowed -exec sh -c 'echo 0 > "$1" 2>/dev/null' _ {} \;
 # RP05 XHC2 SPIT were added on 2026-09-21 for deep (S3): the test that measured
-# 1.37 W had them disarmed. SPIT is the keyboard and trackpad, so from deep only
-# the power button (and the RTC) wake the machine.
-for device in LID0 XHC1 ARPT RP01 RP09 RP10 RP05 XHC2 SPIT; do
+# 1.37 W had them disarmed. SPIT is the keyboard and trackpad, so a key press
+# does not wake the machine from deep. LID0 was dropped from the list the same
+# day: it has to stay armed for the lid to wake the machine from S3.
+for device in XHC1 ARPT RP01 RP09 RP10 RP05 XHC2 SPIT; do
   if grep -q "$device.*enabled" /proc/acpi/wakeup; then
     echo "$device" > /proc/acpi/wakeup
   fi
@@ -105,14 +106,23 @@ done
 sudo chmod +x /usr/local/bin/mbp-suspend-fix.sh
 ```
 
-The first six are issue #207's list. `RP05` is the Thunderbolt root port, `XHC2`
-the xHCI controller inside the Alpine Ridge chip, `SPIT` the SPI topcase — the
-keyboard and trackpad. All three were still armed when `deep` "woke itself after
-10 seconds"; the 1.37 W run had them off and slept its full 30 minutes. Which of
-the three was the spurious wake has not been isolated. The price is that a key
-press no longer wakes the machine from `deep`; the power button does. Whether
-opening the lid does, with `LID0` disarmed as well, is part of the first check
-in step 4 — the 1.37 W run was woken by the RTC and says nothing about it.
+Issue #207's list was `LID0 XHC1 ARPT RP01 RP09 RP10`. `RP05` is the Thunderbolt
+root port, `XHC2` the xHCI controller inside the Alpine Ridge chip, `SPIT` the
+SPI topcase — the keyboard and trackpad. All three were still armed when `deep`
+"woke itself after 10 seconds"; the 1.37 W run had them off and slept its full
+30 minutes. Which of the three was the spurious wake has not been isolated. The
+price is that a key press no longer wakes the machine from `deep`; the power
+button and the lid do.
+
+**`LID0` must stay armed under `deep`.** With it disarmed the lid does not wake
+the machine from S3 at all — tested twice on 2026-09-21, three minutes and one
+minute shut, power button needed both times. The DSDT says why: `LID0._PSW`
+writes the EC's `EWLO` bit ("wake on lid open"), and the kernel evaluates `_PSW`
+only for an armed wakeup source, so with `LID0` disabled the EC is never told to
+wake anybody. Under `s2idle` that never mattered, because the EC stays alive and
+its SCI wakes the kernel regardless. Armed, the lid woke the machine from S3 on
+the first try and caused no spurious wake in a two-minute cycle; whether it
+stays quiet over a night is the remaining check.
 
 ### 3. systemd unit
 
@@ -138,12 +148,11 @@ sudo systemctl enable mbp-suspend-fix.service
 
 ```bash
 cat /sys/power/mem_sleep      # expected: s2idle [deep]
-grep -v disabled /proc/acpi/wakeup   # expected: only the header line
+grep -v disabled /proc/acpi/wakeup   # expected: LID0 and nothing else
 ```
 
-Then the first real cycle: close the lid, wait a minute, open it. If the lid
-does not bring it back, the power button does. Afterwards make sure it really
-was S3 and not a dry run:
+Then the first real cycle: close the lid, wait a minute, open it — the lid
+wakes it. Afterwards make sure it really was S3 and not a dry run:
 
 ```bash
 journalctl -k -b | grep -E 'sleep state S3|suspend debug'
