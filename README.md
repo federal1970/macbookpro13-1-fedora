@@ -57,10 +57,13 @@ Suspend itself works — wake is instant and everything comes back. The problem 
 power: `s2idle` on this machine drains the battery at about half the rate of a
 running system, some 4 W. `deep` (ACPI S3) measures **1.37 W** with the right
 wakeup sources disarmed — a full battery lasts a day and a half instead of half
-a day — and has been the default sleep since 2026-09-21. On battery the lid still
-asks for **suspend-then-hibernate**, so a lid shut for longer than 15 minutes
-ends in hibernation, which costs next to nothing to hold. Both halves work — the hibernate
-half took a while to believe, and `deep` was written off for a day on a bad
+a day — and has been the default sleep since 2026-09-21; a night in it measured
+**0.5 W**. Since 2026-09-22 the lid asks for plain sleep on battery as well:
+timed hibernation cannot fire under `deep` with the lid shut ([the RTC alarm
+does not wake S3](#the-rtc-alarm-does-not-wake-s3-while-the-lid-is-shut-2026-09-22)),
+and at 0.5 W it is not needed. Hibernation stays for the critical-battery action
+and for `systemctl hibernate` by hand. Both halves work — the hibernate half
+took a while to believe, and `deep` was written off for a day on a bad
 measurement; both stories are in [open issues](#open-issues).
 
 The suspend part is based on
@@ -347,14 +350,34 @@ lid open, woke on time. Under `s2idle` on 2026-09-20 the 15-minute alarm fired
 with the lid shut, because there the RTC interrupt is an ordinary wake IRQ and
 no firmware is involved; from S3 the wake goes through the SMC, and a closed
 MacBook does not wake — the same clamshell rule macOS applies unless an
-external display and power are attached. Three observations, no counterexample;
-a controlled lid-shut `rtcwake` test is the confirmation still to run.
+external display and power are attached. Three observations, no counterexample.
+A fourth run the same morning (lid shut 06:55, opened 07:02) adds nothing
+either way: it was over before the 15-minute alarm was due.
 
 What follows from it, together with the 0.5 W above: under `deep`, timed
 hibernation on battery cannot work with the lid closed, and it is not needed.
-Plain `deep` costs about 8% of the battery per night. The battery power profile
-(`Standby, then hibernate`, set on 2026-09-20 for the 4 W `s2idle`) is due to go
-back to plain standby; this file will say so once it has been done.
+Plain `deep` costs about 8% of the battery per night. **Done 2026-09-22:** the
+battery power profile went back from `Standby, then hibernate` (set on
+2026-09-20 for the 4 W `s2idle`) to plain `Standby` — the `SleepMode=3` line
+is gone from `[Battery][SuspendAndShutdown]` in `~/.config/powerdevilrc`, the
+critical-battery action (`BatteryCriticalAction=8`, hibernate) stays, and
+`sleep.conf` is untouched so a manual `systemctl hibernate` still powers off.
+Chapter [4 below](#4-automatic-sleep--hibernate) is kept as the record of how
+the timed variant was set up and verified.
+
+> **Do not chain sleep transitions.** The morning's second test suspended the
+> machine again 3 s after the lid wake (S3 wake, `brcmfmac` loaded, unloaded,
+> S3, wake — 13 s in all). On that resume the Thunderbolt root port `00:1c.4`
+> and everything under it came back `device inaccessible`, pciehp tore the
+> tree down with a kernel WARNING in `xhci_pci_remove`, and from that second
+> PID 1, `logind` and `polkitd` stopped answering in time: the thaw of
+> `user.slice` timed out after 60 s, `sudo` took 93 s to open a session, the
+> polkit helper timed out every 10 s. Wi-Fi never came back — the firmware
+> loaded but every scan hit `brcmf_escan_timeout` and returned `EBUSY`. A
+> `systemctl hibernate` never reached the kernel and two `reboot`s hung on the
+> frozen user units; it took the power button. Ordinary lid cycles before and
+> after were fine. Whether the dead root port is what starved PID 1 cannot be
+> checked after a reset; the timing matches to the second.
 
 ---
 
@@ -596,6 +619,13 @@ brcmfmac`), the next step is to power down the PCIe device itself via `remove` i
 sysfs before sleeping and `rescan` after.
 
 #### 4. Automatic sleep → hibernate
+
+> **Retired on 2026-09-22.** Under `deep` the RTC alarm does not wake the
+> machine while the lid is shut, so the timed hibernation only ever fired on
+> lid open — straight into an image write and a LUKS prompt — and a night of
+> `deep` costs 0.5 W anyway. The battery profile is back on plain `Standby`;
+> what follows is how the timed variant was configured and verified while it
+> was in use, and the `sleep.conf` part still applies to manual hibernation.
 
 Two things have to line up: the lid has to ask for `suspend-then-hibernate`
 rather than a plain suspend, and the delay before the second phase has to be set.
