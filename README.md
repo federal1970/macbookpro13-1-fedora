@@ -12,7 +12,7 @@ off macOS.
 | CPU / GPU | Intel Skylake / Iris Graphics 540 |
 | RAM / storage | 8 GB / 256 GB NVMe (soldered) |
 | OS | Fedora 44 KDE |
-| Kernel | `7.2.5-200.fc44.x86_64` |
+| Kernel | `7.2.6-200.fc44.x86_64` |
 
 Everything below was verified on that exact configuration. Kernel parameters and
 module names are stable across recent Fedora releases, but the FaceTime HD driver
@@ -37,6 +37,7 @@ section.
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Works | Nothing to set; the earlier "very low level" note was wrong — see [open issues](#open-issues) |
+| **Battery charge limit** | **Works** | [SMC key `BCLM` through a patched `applesmc`](#battery-charge-limit-smc-bclm): the SMC stops charging at the limit on its own, verified 2026-09-22 |
 
 Idle temperature sits around **45 °C**, which is normal for Skylake. macOS runs
 cooler because Apple parks cores more aggressively.
@@ -378,6 +379,21 @@ the timed variant was set up and verified.
 > frozen user units; it took the power button. Ordinary lid cycles before and
 > after were fine. Whether the dead root port is what starved PID 1 cannot be
 > checked after a reset; the timing matches to the second.
+>
+> **Refined the same day: it is a 5-second S3 that does it, chained or not.**
+> At 11:51 a suspend requested from the desktop (no lid involved, previous wake
+> 21 minutes earlier) was woken after 5 s and came back with the same dead
+> root port, the same pciehp teardown and the same `xhci_pci_remove` WARNING —
+> though this time PID 1 stayed responsive and only USB-C died until the next
+> reboot. Pairing every `suspend entry` with its S3 wake across all boots
+> (`journalctl -k -b all`, `pm_test` dry runs excluded) gives four real S3s of
+> 5 s — 09-19 20:07, 09-19 20:18, 09-22 07:03, 09-22 11:51 — and all four ended
+> with `pcieport 0000:00:1c.4: ... device inaccessible`; all thirteen S3s of a
+> minute or longer, up to eight hours, came back clean. The working theory is a
+> wake arriving while the Thunderbolt controller is still powering down. The
+> rule that follows: nothing may wake this machine within seconds of entering
+> S3 — no `rtcwake -s 5`, no suspend from a script that has just resumed, and
+> no plugging in the charger the moment the lid shuts.
 
 ---
 
@@ -1194,6 +1210,207 @@ To see what the key actually emits: `sudo keyd monitor`.
 To get macOS-like behaviour, turn off tap-to-click:
 
 **System Settings → Input Devices → Touchpad →** uncheck **Tap-to-click**.
+
+---
+
+## Battery charge limit (SMC `BCLM`)
+
+The battery has 521 cycles and 82% of its design capacity after nearly ten years,
+so it is not in a hurry, but a laptop that lives on the charger ages its battery
+fastest at 100%. ThinkPads expose `charge_control_end_threshold` in sysfs for
+that; this machine exposes nothing: `/sys/class/power_supply/BAT0/` has no
+threshold attributes, `applesmc` only *reads* SMC keys through `key_at_index`,
+and there is no macOS left on the disk to run `bclm`.
+
+The cap itself, however, is not a macOS feature. It is the SMC key **`BCLM`**
+("Battery Charge Level Max", one byte, percent), which the macOS tool
+[`bclm`](https://github.com/zackelia/bclm) writes. The SMC enforces it on its
+own, the value survives reboots and operating systems, and only an SMC reset
+puts it back to 100. So the only missing piece under Linux is a way to write
+one SMC key.
+
+### 1. Does this SMC have the key?
+
+`applesmc` can walk the key table as root. [`tools/smc-keys.sh`](tools/smc-keys.sh)
+selects each of the 798 indices in turn and prints the battery-related keys:
+
+```console
+$ sudo tools/smc-keys.sh
+B0FC type=ui16 len=2 data=0f82
+B0RM type=ui16 len=2 data=080f
+BBIF type=ui8  len=1 data=0e
+BCLM type=ui8  len=1 data=64
+BRSC type=ui16 len=2 data=0034
+CH0B type=hex_ len=1 data=00
+```
+
+`BCLM` is there and reads `0x64` = 100, no cap. `B0FC` (`0x0f82` = 3970 mAh) is
+the full-charge figure and matches `charge_full` in sysfs (3931 mAh), so the
+reads are sound. `B0RM` and `BRSC` read higher than the kernel's `charge_now`
+and percentage did at that moment; not investigated, they are not needed here.
+
+### 2. The patch
+
+`applesmc` already writes keys — that is how it drives the fans and the keyboard
+backlight — it just does not expose a generic write. One sysfs attribute,
+`battery_charge_limit`, that reads and writes `BCLM` through the driver's own
+`applesmc_read_key()` / `applesmc_write_key()`. The range is 50..100, the same
+window `bclm` allows. Against `drivers/hwmon/applesmc.c` from Linux v7.2:
+
+```diff
+--- applesmc.orig.c	2026-09-22 12:06:30.908125151 +0200
++++ applesmc.c	2026-09-22 12:06:30.931821653 +0200
+@@ -1066,6 +1066,44 @@
+ 	return count;
+ }
+ 
++/*
++ * BCLM - "Battery Charge Level Max": the charge cap the SMC enforces on its
++ * own, in percent. It is what the macOS tool `bclm` writes. The value lives
++ * in the SMC and survives reboots and OS changes; an SMC reset restores 100.
++ * The SMC ignores values it does not like, hence the same 50..100 window
++ * that bclm allows.
++ */
++#define BCLM_KEY	"BCLM"
++
++static ssize_t applesmc_battery_charge_limit_show(struct device *dev,
++				struct device_attribute *attr, char *sysfsbuf)
++{
++	u8 val;
++	int ret;
++
++	ret = applesmc_read_key(BCLM_KEY, &val, 1);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(sysfsbuf, "%u\n", val);
++}
++
++static ssize_t applesmc_battery_charge_limit_store(struct device *dev,
++	struct device_attribute *attr, const char *sysfsbuf, size_t count)
++{
++	u8 val;
++	int ret;
++
++	if (kstrtou8(sysfsbuf, 10, &val) || val < 50 || val > 100)
++		return -EINVAL;
++
++	ret = applesmc_write_key(BCLM_KEY, &val, 1);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
+ static struct led_classdev applesmc_backlight = {
+ 	.name			= "smc::kbd_backlight",
+ 	.default_trigger	= "nand-disk",
+@@ -1080,6 +1118,8 @@
+ 	{ "key_at_index_type", applesmc_key_at_index_type_show },
+ 	{ "key_at_index_data_length", applesmc_key_at_index_data_length_show },
+ 	{ "key_at_index_data", applesmc_key_at_index_read_show },
++	{ "battery_charge_limit", applesmc_battery_charge_limit_show,
++	  applesmc_battery_charge_limit_store },
+ 	{ }
+ };
+ 
+@@ -1415,5 +1455,5 @@
+ module_exit(applesmc_exit);
+ 
+ MODULE_AUTHOR("Nicolas Boichat");
+-MODULE_DESCRIPTION("Apple SMC");
++MODULE_DESCRIPTION("Apple SMC (with battery_charge_limit / BCLM)");
+ MODULE_LICENSE("GPL v2");
+```
+
+### 3. Build through DKMS
+
+The module keeps its name, `applesmc`, and goes to `/extra`, which `depmod` on
+Fedora prefers over the in-tree copy — the same mechanism the
+[audio driver](#audio-cirrus-cs8409) relies on. Source directory
+`~/dev/applesmc-bclm/` with the patched `applesmc.c` and:
+
+`Makefile`:
+
+```makefile
+ifneq ($(KERNELRELEASE),)
+obj-m := applesmc.o
+else
+KDIR ?= /lib/modules/$(shell uname -r)/build
+default:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+endif
+```
+
+`dkms.conf`:
+
+```
+PACKAGE_NAME=applesmc-bclm
+PACKAGE_VERSION=1.0
+BUILT_MODULE_NAME[0]="applesmc"
+BUILT_MODULE_LOCATION[0]="."
+DEST_MODULE_LOCATION[0]="/extra"
+AUTOINSTALL="yes"
+```
+
+```bash
+sudo ln -sfn "$HOME/dev/applesmc-bclm" /usr/src/applesmc-bclm-1.0
+sudo dkms install applesmc-bclm/1.0
+sudo modprobe -r applesmc && sudo modprobe applesmc
+modinfo -n applesmc            # must end in extra/applesmc.ko.xz
+```
+
+The keyboard backlight goes dark for a second while the module is swapped;
+that is `applesmc` releasing and re-registering the LED.
+
+### 4. Use and verify
+
+```bash
+cat /sys/devices/platform/applesmc.768/battery_charge_limit    # 100 = no cap
+echo 80 | sudo tee /sys/devices/platform/applesmc.768/battery_charge_limit
+```
+
+Nothing to add at boot: the value lives in the SMC. `echo 100` removes the cap.
+The proof is the charger: plugged in above the limit, `BAT0/status` must read
+`Not charging` (or `Full`) and the percentage must stop rising. The cap never
+discharges the battery down to the limit; it only stops charging there.
+
+**Verified 2026-09-22.** Module from `extra/`, `battery_charge_limit` written
+to 80 at 12:13 with the battery at 63%, charger plugged in. Charging ran at a
+steady 1.55 A and stopped at 12:40:59:
+
+```
+$ cat /sys/class/power_supply/BAT0/status; cat /sys/class/power_supply/BAT0/charge_now
+Full
+3115000            # 79.2% of charge_full (3931000), charger still connected
+```
+
+`current_now` went to 0 and stayed there; the SMC cut the charge by itself, no
+software involved after the one write. It stops a fraction below the number
+(79.2% for 80), which is the gauge's granularity, not a bug. `upower` kept
+saying `charging, 31 minutes to full` for a while after that: it estimates from
+its own history and catches up on the next state change, so read sysfs, not
+`upower`, when checking the cap.
+
+### Kernel updates
+
+The source is frozen at v7.2. DKMS rebuilds it for every 7.2.x, but the day
+`dkms` fails on a newer series, fetch that kernel's `drivers/hwmon/applesmc.c`,
+apply the diff above, replace the file and reinstall.
+
+### Upstream
+
+A private sysfs name in a hwmon driver is a local hack and would not be merged.
+The kernel's interface for this is `charge_control_end_threshold` on the battery
+itself, added by the driver through `battery_hook_register()` from
+`include/acpi/battery.h` — the way `thinkpad_acpi` and the other laptop drivers
+do it. UPower and Plasma understand that attribute, so the limit would show up in
+KDE's power settings with no sysfs involved. That rewrite, guarded by
+`applesmc_has_key("BCLM")` so Macs without the key see nothing, is the plan once
+the charger test above has passed; the local patch stays as the proof that the
+SMC honours the key.
 
 ---
 
