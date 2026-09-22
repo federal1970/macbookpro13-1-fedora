@@ -31,7 +31,7 @@ section.
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
-| **Suspend / resume** | **Works, `deep` (S3) drains 1.37 W** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
+| **Suspend / resume** | **Works, `deep` (S3) drains ~0.5 W over a night** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
@@ -313,8 +313,48 @@ its suspend handler turns off only the caps-lock LED, and the backlight has no
 `LED_CORE_SUSPENDRESUME` flag — so at any nonzero level it burns for the whole
 of s2idle. In S3 the rail is cut and it cannot matter.
 
-Still 3-4 times what macOS draws in the same S3 (0.3-0.5 W); where the rest goes
-is the subject of the next chapter.
+**Overnight it is 0.5 W, not 1.37 W.** The 30-minute figure above rests on
+55 mAh from a gauge whose before/after bias is about 26 mAh, so it was really
+anywhere between 0.7 and 2 W. The night of 2026-09-21 settled it: lid shut on
+battery from 22:47 to 06:46, one continuous S3 (see the next section for why it
+never hibernated), `charge_now` 3364 → 3030 mAh:
+
+| | |
+|---|---|
+| time in S3 | 7 h 59 min |
+| used | 334 mAh ≈ 4.0 Wh, including one hibernate-and-resume transition (~0.32 Wh) and a minute awake |
+| **S3 alone** | **≈ 0.46–0.50 W** |
+| a full battery (46 Wh) in S3 | ~4 days |
+
+That is inside macOS's 0.3–0.5 W on the same hardware. The firmware power-off
+methods of the next chapter would still shave something, but there is no longer
+a 3× gap to close.
+
+### The RTC alarm does not wake S3 while the lid is shut (2026-09-22)
+
+The same night was meant to be a 15-minute `suspend-then-hibernate`. It was not:
+the journal has one `suspend entry (deep)` at 22:47:28 and the next line is the
+S3 wake at 06:46:48, when the lid was opened. The RTC alarm systemd had set for
+23:02 did nothing. systemd then found the delay long elapsed and hibernated on
+the spot, so opening the lid in the morning led straight into an image write
+and a LUKS prompt — the worst of both arrangements.
+
+It is the lid, not the alarm. The evening before, a hands-off run with the lid
+open and a 2-minute delay woke at exactly 2 minutes; an identical run with the
+lid shut woke only when the lid was opened at six minutes (misread at the time
+as "the user opened it early"); every `rtcwake` run of `tools/deep-test.sh`,
+lid open, woke on time. Under `s2idle` on 2026-09-20 the 15-minute alarm fired
+with the lid shut, because there the RTC interrupt is an ordinary wake IRQ and
+no firmware is involved; from S3 the wake goes through the SMC, and a closed
+MacBook does not wake — the same clamshell rule macOS applies unless an
+external display and power are attached. Three observations, no counterexample;
+a controlled lid-shut `rtcwake` test is the confirmation still to run.
+
+What follows from it, together with the 0.5 W above: under `deep`, timed
+hibernation on battery cannot work with the lid closed, and it is not needed.
+Plain `deep` costs about 8% of the battery per night. The battery power profile
+(`Standby, then hibernate`, set on 2026-09-20 for the 4 W `s2idle`) is due to go
+back to plain standby; this file will say so once it has been done.
 
 ---
 
@@ -342,7 +382,7 @@ everything about sleep power branches on the answer.
   changes are in [`acpi/README.md`](acpi/README.md). The Boot Camp path is
   closed; what it would have switched off has to be called by hand instead.
 
-So the 4 W of s2idle and the 1.37 W of `deep` above were measured with
+So the 4 W of s2idle and the 0.5–1.4 W of `deep` above were measured with
 Thunderbolt, camera and Bluetooth powered and nobody asking the firmware to
 switch them off. That is not
 firmware that needs reverse-engineering — the methods exist, are named, and can be
