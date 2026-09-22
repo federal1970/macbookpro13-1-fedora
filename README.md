@@ -31,7 +31,7 @@ section.
 | Trackpad + gestures | Works out of the box | [Disable tap-to-click](#trackpad) if you want macOS-like behaviour |
 | Keyboard, backlight, screen brightness | Works out of the box | — |
 | NVMe, battery, USB-C | Works out of the box | — |
-| **Suspend / resume** | **Works, `deep` (S3) drains ~0.5 W over a night** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
+| **Suspend / resume** | **Works with the lid shut, `deep` (S3) drains ~0.5 W over a night** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
 | **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
@@ -104,6 +104,12 @@ for device in XHC1 ARPT RP01 RP09 RP10 RP05 XHC2 SPIT; do
     echo "$device" > /proc/acpi/wakeup
   fi
 done
+# LID0 is the only thing that wakes this machine from deep. It came up disarmed
+# after a hard reset on 2026-09-22 (a lid shut in that state cannot be woken),
+# so arm it here every time instead of trusting the default.
+if grep -q "^LID0.*disabled" /proc/acpi/wakeup; then
+  echo LID0 > /proc/acpi/wakeup
+fi
 ```
 
 ```bash
@@ -128,6 +134,25 @@ its SCI wakes the kernel regardless. Armed, the lid woke the machine from S3 on
 the first try and caused no spurious wake in any of the six S3 cycles that
 evening (two to seven minutes each); whether it stays quiet over a night is
 the remaining check.
+
+**The other half, found on 2026-09-22: armed, `LID0` also means the machine
+cannot sleep with the lid open.** The EC treats `EWLO` as a level, not an edge:
+an already-open lid *is* the wake condition, so an S3 entered with the lid open
+ends the moment it begins. Every such case in the journal did exactly that —
+the 07:03 and 11:51 suspends, twenty-two KDE idle suspends that afternoon, and
+one more after a clean reboot with the Thunderbolt port hidden by the firmware,
+which is what ruled the port out as the cause. The alternative is worse:
+`LID0` disarmed and the lid open, `systemctl suspend` at 20:00 — the machine
+never came back, the power button did nothing, and the journal stops at the
+hook's `brcmfmac` unload, so whether it slept and could not be woken or never
+reached S3 the log cannot say. It took a hard reset, and after that reset
+`LID0` came up *disarmed*, the one state in which a shut lid is a trap. Hence
+the two rules now in force: the fix script arms `LID0` unconditionally, and
+this machine is put to sleep by shutting the lid and by nothing else — KDE's
+battery idle action must not be "sleep" (its default of 15 minutes is what ran
+the afternoon's loop). The one run that does not fit is the 2-minute lid-open
+run of 2026-09-21 22:15 that held until its alarm; the `LID0` state during it
+was not recorded.
 
 ### 3. systemd unit
 
@@ -394,6 +419,15 @@ the timed variant was set up and verified.
 > rule that follows: nothing may wake this machine within seconds of entering
 > S3 — no `rtcwake -s 5`, no suspend from a script that has just resumed, and
 > no plugging in the charger the moment the lid shuts.
+>
+> **And the evening's answer to what those instant wakes were:** the lid. Every
+> one of them was an S3 entered with the lid open and `LID0` armed, and the EC
+> reads "wake on lid open" as a level — see
+> [`LID0` must stay armed](#2-boot-time-fix-script). The dead port was the
+> casualty, not the cause: after a reboot with the port hidden by the firmware
+> a lid-open suspend still woke in the same second. The afternoon's "screen
+> turns off and comes back by itself" was KDE's 15-minute idle suspend on
+> battery doing this twenty-two times in a row.
 
 ---
 
