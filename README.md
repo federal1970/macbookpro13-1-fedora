@@ -62,10 +62,35 @@ a day — and has been the default sleep since 2026-09-21; a night in it measure
 **0.5 W**. Since 2026-09-22 the lid asks for plain sleep on battery as well:
 timed hibernation cannot fire under `deep` with the lid shut ([the RTC alarm
 does not wake S3](#the-rtc-alarm-does-not-wake-s3-while-the-lid-is-shut-2026-09-22)),
-and at 0.5 W it is not needed. Hibernation stays for the critical-battery action
-and for `systemctl hibernate` by hand. Both halves work — the hibernate half
-took a while to believe, and `deep` was written off for a day on a bad
-measurement; both stories are in [open issues](#open-issues).
+and at 0.5 W it is not needed. Hibernation stays for the idle timeout on
+battery with the lid open, and for `systemctl hibernate` by hand. Both halves
+work — the hibernate half took a while to believe, and `deep` was written off
+for a day on a bad measurement; both stories are in [open issues](#open-issues).
+
+### Why there is no "sleep, then hibernate" here — and why it does not matter
+
+macOS on this machine does what it calls Standby: a while in S3, then a timed
+transition to hibernation. Linux has the same thing — `suspend-then-hibernate`
+in systemd, "Standby, then hibernate" in KDE — and it was in use here for two
+days. It cannot work on this hardware under `deep`. To go from sleep to
+hibernation the machine has to wake itself on an RTC alarm, write the image
+and power off, and this Mac's SMC does not let an RTC alarm wake S3 while the
+lid is shut: the same clamshell rule macOS applies, a closed laptop without
+an external display and power wakes for nothing but the lid. macOS gets past
+it through its own SMC driver and a firmware path the ACPI tables expose
+only to macOS ([two sleep paths, Linux walks neither](#what-the-acpi-tables-say--two-sleep-paths-linux-walks-neither-2026-09-21)).
+The night of 2026-09-21 showed it: the alarm set for 23:02 did nothing, and
+the hibernation happened at 06:46 when the lid was opened — an image write
+and a LUKS prompt as the first thing in the morning.
+
+Under `s2idle` the same alarm fired fine, because there the EC stays alive
+and its interrupt reaches the kernel without the SMC's consent — and at
+s2idle's 4 W a hibernation after 15 minutes was genuinely needed. Under
+`deep` it became impossible and unnecessary in the same step: 0.4–0.5 W over a
+night is macOS's own Standby figure, not a level worth fleeing into
+hibernation from. So sleep is `deep` and is entered by shutting the lid;
+hibernation is kept where the lid cannot interfere — the idle timeout with the
+lid open, and by hand.
 
 The suspend part is based on
 [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
