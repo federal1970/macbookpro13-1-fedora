@@ -154,6 +154,16 @@ the afternoon's loop). The one run that does not fit is the 2-minute lid-open
 run of 2026-09-21 22:15 that held until its alarm; the `LID0` state during it
 was not recorded.
 
+What replaces the idle sleep is hibernation, which does not care about the lid
+at all: the machine powers off and the power button boots it, LUKS passphrase
+and all. A manual `systemctl hibernate` with the lid open on 2026-09-22 20:22
+went through cleanly (image written, 92 s of nothing in the journal, passphrase
+asked, session back, Wi-Fi reloaded by the hook), so the battery profile now
+reads `AutoSuspendAction=2` (hibernate) after 15 minutes idle, mains does
+nothing, and the lid does plain `deep`. Verified against powerdevil's enum:
+`Hibernate = 2`, `Shutdown = 8` — which is also why the critical-battery
+action set earlier is a shutdown, not the hibernation this file used to claim.
+
 ### 3. systemd unit
 
 `/etc/systemd/system/mbp-suspend-fix.service`:
@@ -359,6 +369,27 @@ That is inside macOS's 0.3–0.5 W on the same hardware. The firmware power-off
 methods of the next chapter would still shave something, but there is no longer
 a 3× gap to close.
 
+**Second night, 2026-09-22 → 23, same answer.** Lid shut at 20:31 on battery,
+opened at 08:42, one continuous S3 of 12 h 10 min, not a single journal line in
+between, woken by the lid, Wi-Fi back, no errors. The before figure this time
+is an estimate: `upowerd` stopped writing its history file at the manual
+hibernation of 20:22 and only resumed sampling in memory at the wake, so the
+last on-disk reading is 60.8% at 20:22, followed by the hibernate-and-resume
+cycle and seven minutes awake at 7.5 W (about 2.5% together), giving ~58%
+at the lid. After: 46.2% at 08:42, `charge_now` 1788 mAh a minute later.
+
+| | |
+|---|---|
+| time in S3 | 12 h 10 min |
+| used | ~12% ≈ 5.3 Wh, ±1.5% on the estimated start |
+| **S3 alone** | **≈ 0.4–0.5 W** |
+
+A 3-hour lid-shut sleep in the afternoon of 2026-09-22 had come out at about
+0.8 W (5.2% over 2 h 55 min from upower's own log, both readings clean), so the
+honest range for this machine in S3 is 0.4–0.9 W; the two full nights sit at
+the low end, and what makes a daytime sleep cost more — a warmer room, the
+state of charge, gauge bias on a short interval — has not been separated.
+
 ### The RTC alarm does not wake S3 while the lid is shut (2026-09-22)
 
 The same night was meant to be a 15-minute `suspend-then-hibernate`. It was not:
@@ -386,7 +417,10 @@ Plain `deep` costs about 8% of the battery per night. **Done 2026-09-22:** the
 battery power profile went back from `Standby, then hibernate` (set on
 2026-09-20 for the 4 W `s2idle`) to plain `Standby` — the `SleepMode=3` line
 is gone from `[Battery][SuspendAndShutdown]` in `~/.config/powerdevilrc`, the
-critical-battery action (`BatteryCriticalAction=8`, hibernate) stays, and
+critical-battery action (`BatteryCriticalAction=8`) stays — which, checked
+against powerdevil's enum on 2026-09-22, is *shut down*, not hibernate
+(`Hibernate = 2`, `Shutdown = 8`); earlier revisions of this file had it
+wrong — and
 `sleep.conf` is untouched so a manual `systemctl hibernate` still powers off.
 Chapter [4 below](#4-automatic-sleep--hibernate) is kept as the record of how
 the timed variant was set up and verified.
