@@ -1393,16 +1393,27 @@ and percentage did at that moment; not investigated, they are not needed here.
 ### 2. The patch
 
 `applesmc` already writes keys — that is how it drives the fans and the keyboard
-backlight — it just does not expose a generic write. One sysfs attribute,
-`battery_charge_limit`, that reads and writes `BCLM` through the driver's own
-`applesmc_read_key()` / `applesmc_write_key()`. The range is 50..100, the same
-window `bclm` allows. Two more attributes, `key_name` and `key_data`, were
-added on 2026-09-23 for the [wake-timer probes below](#sleep-then-hibernate-from-linux-what-the-smc-allows-2026-09-23):
-write a four-letter key name to the first, and the second reads the key as hex
-or writes hex of exactly the key's length; `key_name` reads back the key's
-type, length and the SMC's own read/write flags. Root-only writes, no range
-checks — an instrument, not a feature. Against `drivers/hwmon/applesmc.c` from
-Linux v7.2:
+backlight — it just does not expose a generic write. The first version
+(2026-09-22) added a private sysfs attribute, `battery_charge_limit`, on the
+`applesmc` platform device. The version installed since 2026-09-23 does it the
+way the kernel wants it done: the limit is the standard
+`charge_control_end_threshold` property **on the battery itself**,
+`/sys/class/power_supply/BAT0/charge_control_end_threshold`, added through a
+*power supply extension* (`power_supply_register_extension()`), so it also
+turns up in the battery's uevent and in UPower. One detail cost an hour: the
+ACPI *battery hook* that ThinkPad and the WMI drivers use for exactly this
+never fires here, because an Intel Mac's battery is an ACPI Smart Battery
+(`ACPI0002`, driver `sbs`), not a `PNP0C0A` battery — the hook registered and
+nothing happened. So the driver walks the registered supplies for a battery
+and, if none is there yet, attaches on the battery's first property-change
+notification. Writes are validated 1..100 and read back, because the SMC
+silently drops values it does not accept (the wake-timer chapter below is a
+whole story of that). Two more attributes on the platform device, `key_name`
+and `key_data`, are local instruments for probing SMC keys — write a
+four-letter key name to the first, and the second reads the key as hex or
+writes hex of exactly its length; `key_name` reads back type, length and the
+SMC's read/write flags. Root-only, no checks, not part of the upstream patch.
+The diff against `drivers/hwmon/applesmc.c` from Linux v7.2, as installed:
 
 ```diff
 --- drivers/hwmon/applesmc.c (Linux v7.2)
@@ -1415,48 +1426,201 @@ Linux v7.2:
  #include <linux/timer.h>
  #include <linux/dmi.h>
  #include <linux/mutex.h>
-@@ -1066,6 +1067,122 @@
+@@ -33,6 +34,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/err.h>
+ #include <linux/bits.h>
++#include <linux/power_supply.h>
+ 
+ /* data port used by Apple SMC */
+ #define APPLESMC_DATA_PORT	0x300
+@@ -64,6 +66,8 @@
+ 
+ #define CLAMSHELL_KEY		"MSLD" /* r-o ui8 (unused) */
+ 
++#define CHARGE_LIMIT_KEY	"BCLM" /* r/w ui8, percent */
++
+ #define MOTION_SENSOR_X_KEY	"MO_X" /* r-o sp78 (2 bytes) */
+ #define MOTION_SENSOR_Y_KEY	"MO_Y" /* r-o sp78 (2 bytes) */
+ #define MOTION_SENSOR_Z_KEY	"MO_Z" /* r-o sp78 (2 bytes) */
+@@ -130,6 +134,7 @@
+ 	int num_light_sensors;		/* number of light sensors */
+ 	bool has_accelerometer;		/* has motion sensor */
+ 	bool has_key_backlight;		/* has keyboard backlight */
++	bool has_charge_limit;		/* has battery charge limit */
+ 	bool init_complete;		/* true when fully initialized */
+ 	struct applesmc_entry *cache;	/* cached key entries */
+ 	const char **index;		/* temperature key index */
+@@ -621,6 +626,9 @@
+ 	ret = applesmc_has_key(BACKLIGHT_KEY, &s->has_key_backlight);
+ 	if (ret)
+ 		return ret;
++	ret = applesmc_has_key(CHARGE_LIMIT_KEY, &s->has_charge_limit);
++	if (ret)
++		return ret;
+ 
+ 	s->num_light_sensors = left_light_sensor + right_light_sensor;
+ 	s->init_complete = true;
+@@ -669,6 +677,155 @@
+ }
+ 
+ /* Device model stuff */
++/*
++ * Battery charge limit
++ *
++ * The SMC key BCLM holds the maximum charge level in percent and the SMC
++ * enforces it by itself: charging stops there and the value is kept across
++ * reboots; 100 means no limit. It is the setting the macOS tool "bclm"
++ * writes. Expose it as charge_control_end_threshold on the battery through
++ * a power supply extension. The battery of an Intel Mac is an ACPI Smart
++ * Battery (sbs), which the ACPI battery hooks do not cover, so the battery
++ * is found by walking the registered supplies; if it is not there yet when
++ * this driver loads, the first property-change notification from it does
++ * the job.
++ */
++static const enum power_supply_property applesmc_battery_props[] = {
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++};
++
++static int applesmc_battery_get_property(struct power_supply *psy,
++					 const struct power_supply_ext *ext,
++					 void *data,
++					 enum power_supply_property psp,
++					 union power_supply_propval *val)
++{
++	u8 limit;
++	int ret;
++
++	if (psp != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
++		return -EINVAL;
++
++	ret = applesmc_read_key(CHARGE_LIMIT_KEY, &limit, 1);
++	if (ret)
++		return ret;
++
++	val->intval = limit;
++	return 0;
++}
++
++static int applesmc_battery_set_property(struct power_supply *psy,
++					 const struct power_supply_ext *ext,
++					 void *data,
++					 enum power_supply_property psp,
++					 const union power_supply_propval *val)
++{
++	u8 limit, readback;
++	int ret;
++
++	if (psp != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
++		return -EINVAL;
++	if (val->intval < 1 || val->intval > 100)
++		return -EINVAL;
++
++	limit = val->intval;
++	ret = applesmc_write_key(CHARGE_LIMIT_KEY, &limit, 1);
++	if (ret)
++		return ret;
++
++	/* The SMC silently ignores values it does not accept. */
++	ret = applesmc_read_key(CHARGE_LIMIT_KEY, &readback, 1);
++	if (ret)
++		return ret;
++	if (readback != limit)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int applesmc_battery_property_is_writeable(struct power_supply *psy,
++						  const struct power_supply_ext *ext,
++						  void *data,
++						  enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
++static const struct power_supply_ext applesmc_battery_ext = {
++	.name = "applesmc-charge-limit",
++	.properties = applesmc_battery_props,
++	.num_properties = ARRAY_SIZE(applesmc_battery_props),
++	.get_property = applesmc_battery_get_property,
++	.set_property = applesmc_battery_set_property,
++	.property_is_writeable = applesmc_battery_property_is_writeable,
++};
++
++static struct power_supply *applesmc_battery;	/* the extended supply */
++static DEFINE_MUTEX(applesmc_battery_mutex);
++
++static int applesmc_battery_extend(struct power_supply *psy, void *data)
++{
++	int ret;
++
++	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
++		return 0;
++
++	ret = power_supply_register_extension(psy, &applesmc_battery_ext,
++					      &pdev->dev, NULL);
++	if (ret)
++		return ret;
++
++	get_device(&psy->dev);
++	applesmc_battery = psy;
++	return 1;	/* one battery is enough, stop walking */
++}
++
++static void applesmc_battery_attach(struct work_struct *work)
++{
++	mutex_lock(&applesmc_battery_mutex);
++	if (!applesmc_battery)
++		power_supply_for_each_psy(NULL, applesmc_battery_extend);
++	mutex_unlock(&applesmc_battery_mutex);
++}
++
++static DECLARE_WORK(applesmc_battery_work, applesmc_battery_attach);
++
++static int applesmc_battery_notify(struct notifier_block *nb,
++				   unsigned long event, void *data)
++{
++	if (event == PSY_EVENT_PROP_CHANGED && !applesmc_battery)
++		schedule_work(&applesmc_battery_work);
++	return NOTIFY_OK;
++}
++
++static struct notifier_block applesmc_battery_nb = {
++	.notifier_call = applesmc_battery_notify,
++};
++
++static void applesmc_battery_init(void)
++{
++	if (!smcreg.has_charge_limit)
++		return;
++	power_supply_reg_notifier(&applesmc_battery_nb);
++	applesmc_battery_attach(NULL);
++}
++
++static void applesmc_battery_exit(void)
++{
++	if (!smcreg.has_charge_limit)
++		return;
++	power_supply_unreg_notifier(&applesmc_battery_nb);
++	cancel_work_sync(&applesmc_battery_work);
++	mutex_lock(&applesmc_battery_mutex);
++	if (applesmc_battery) {
++		power_supply_unregister_extension(applesmc_battery,
++						  &applesmc_battery_ext);
++		power_supply_put(applesmc_battery);
++		applesmc_battery = NULL;
++	}
++	mutex_unlock(&applesmc_battery_mutex);
++}
++
+ static int applesmc_probe(struct platform_device *dev)
+ {
+ 	int ret;
+@@ -1066,6 +1223,84 @@
  	return count;
  }
  
-+/*
-+ * BCLM - "Battery Charge Level Max": the charge cap the SMC enforces on its
-+ * own, in percent. It is what the macOS tool `bclm` writes. The value lives
-+ * in the SMC and survives reboots and OS changes; an SMC reset restores 100.
-+ * The SMC ignores values it does not like, hence the same 50..100 window
-+ * that bclm allows.
-+ */
-+#define BCLM_KEY	"BCLM"
-+
-+static ssize_t applesmc_battery_charge_limit_show(struct device *dev,
-+				struct device_attribute *attr, char *sysfsbuf)
-+{
-+	u8 val;
-+	int ret;
-+
-+	ret = applesmc_read_key(BCLM_KEY, &val, 1);
-+	if (ret)
-+		return ret;
-+
-+	return sysfs_emit(sysfsbuf, "%u\n", val);
-+}
-+
-+static ssize_t applesmc_battery_charge_limit_store(struct device *dev,
-+	struct device_attribute *attr, const char *sysfsbuf, size_t count)
-+{
-+	u8 val;
-+	int ret;
-+
-+	if (kstrtou8(sysfsbuf, 10, &val) || val < 50 || val > 100)
-+		return -EINVAL;
-+
-+	ret = applesmc_write_key(BCLM_KEY, &val, 1);
-+	if (ret)
-+		return ret;
-+
-+	return count;
-+}
-+
 +/*
 + * Generic key access for experiments: write a four-letter key name to
 + * key_name, then read key_data (hex) or write hex of exactly the key's
@@ -1538,23 +1702,38 @@ Linux v7.2:
  static struct led_classdev applesmc_backlight = {
  	.name			= "smc::kbd_backlight",
  	.default_trigger	= "nand-disk",
-@@ -1080,6 +1197,10 @@
+@@ -1080,6 +1315,8 @@
  	{ "key_at_index_type", applesmc_key_at_index_type_show },
  	{ "key_at_index_data_length", applesmc_key_at_index_data_length_show },
  	{ "key_at_index_data", applesmc_key_at_index_read_show },
-+	{ "battery_charge_limit", applesmc_battery_charge_limit_show,
-+	  applesmc_battery_charge_limit_store },
 +	{ "key_name", applesmc_key_name_show, applesmc_key_name_store },
 +	{ "key_data", applesmc_key_data_show, applesmc_key_data_store },
  	{ }
  };
  
-@@ -1415,5 +1536,5 @@
+@@ -1369,6 +1606,8 @@
+ 		goto out_light_ledclass;
+ 	}
+ 
++	applesmc_battery_init();
++
+ 	return 0;
+ 
+ out_light_ledclass:
+@@ -1398,6 +1637,7 @@
+ 
+ static void __exit applesmc_exit(void)
+ {
++	applesmc_battery_exit();
+ 	hwmon_device_unregister(hwmon_dev);
+ 	applesmc_release_key_backlight();
+ 	applesmc_release_light_sensor();
+@@ -1415,5 +1655,5 @@
  module_exit(applesmc_exit);
  
  MODULE_AUTHOR("Nicolas Boichat");
 -MODULE_DESCRIPTION("Apple SMC");
-+MODULE_DESCRIPTION("Apple SMC (with battery_charge_limit / BCLM and key_name/key_data)");
++MODULE_DESCRIPTION("Apple SMC (charge_control_end_threshold, key_name/key_data)");
  MODULE_LICENSE("GPL v2");
 ```
 
@@ -1603,8 +1782,8 @@ that is `applesmc` releasing and re-registering the LED.
 ### 4. Use and verify
 
 ```bash
-cat /sys/devices/platform/applesmc.768/battery_charge_limit    # 100 = no cap
-echo 80 | sudo tee /sys/devices/platform/applesmc.768/battery_charge_limit
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold    # 100 = no cap
+echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
 ```
 
 Nothing to add at boot: the value lives in the SMC. `echo 100` removes the cap.
@@ -1637,15 +1816,17 @@ apply the diff above, replace the file and reinstall.
 
 ### Upstream
 
-A private sysfs name in a hwmon driver is a local hack and would not be merged.
-The kernel's interface for this is `charge_control_end_threshold` on the battery
-itself, added by the driver through `battery_hook_register()` from
-`include/acpi/battery.h` — the way `thinkpad_acpi` and the other laptop drivers
-do it. UPower and Plasma understand that attribute, so the limit would show up in
-KDE's power settings with no sysfs involved. That rewrite, guarded by
-`applesmc_has_key("BCLM")` so Macs without the key see nothing, is the plan once
-the charger test above has passed; the local patch stays as the proof that the
-SMC honours the key.
+The patch as sent to linux-hwmon — the extension part only, without the probe
+attributes — is
+[`0001-hwmon-applesmc-Expose-the-SMC-battery-charge-limit.patch`](https://github.com/federal1970/macbookpro13-1-fedora/blob/master/applesmc-bclm/0001-hwmon-applesmc-Expose-the-SMC-battery-charge-limit.patch)
+in this repository: 75 lines against v7.2, `checkpatch --strict` clean,
+`depends on POWER_SUPPLY` in Kconfig, tested on this machine as described in
+its message. Recipients: linux-hwmon@vger.kernel.org, the applesmc maintainer
+(Henrik Rydberg, "odd fixes"), the hwmon maintainers (Guenter Roeck, Jean
+Delvare), Cc linux-acpi and linux-kernel. Kernel patches go by plain-text
+e-mail, not pull requests — `git send-email` with a Gmail app password does
+it. Sent on 2026-09-23 16:41 CEST, archived at
+<https://lore.kernel.org/linux-hwmon/20260923144117.295450-1-michi.szpakowski@gmail.com/>; this section will record what the review said.
 
 ---
 
