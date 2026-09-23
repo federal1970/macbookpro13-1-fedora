@@ -92,6 +92,54 @@ hibernation from. So sleep is `deep` and is entered by shutting the lid;
 hibernation is kept where the lid cannot interfere — the idle timeout with the
 lid open, and by hand.
 
+### Sleep, then hibernate from Linux: what the SMC allows (2026-09-23)
+
+The battery cap worked because the SMC had a key for it and only the write
+was missing. Could the same trick give Linux macOS's Standby — a timed wake
+from S3 with the lid shut? A day of probing says no, and here is the evidence
+so nobody has to repeat it.
+
+**The SMC's clock keys exist and refuse to be set.** A dump of all 798 keys
+([`tools/smc-dump-keys.sh`](tools/smc-dump-keys.sh)) has `CLKT` (ui32, a clock
+that advances one per second while awake, base unrelated to wall time),
+`CLWK` (ui16, reads `ffff`), `CLSD` (ui16, 0), `WKEN`/`WKTP` (ui8, 0) and
+`MSWr` (the last wake reason). The SMC flags `CLWK`, `CLKT`, `CLSD` and `WKTP`
+as readable *and* writable ([`tools/smc-wake-probe.sh`](tools/smc-wake-probe.sh));
+`WKEN` and `MSWr` are read-only. Yet every write to `CLWK` — 120 and 2 as a
+relative count, `CLKT + 120` as an absolute time — came straight back as
+`ffff`, with no error from the driver: the key's handler (flag `0x10`, "func")
+validates and drops it. Two lid-shut sleeps in between held for two hours and
+half an hour respectively, so nothing was armed by accident.
+
+**The EC has a wake-enable bank, and it names a wake timer.** The DSDT's
+`EmbeddedControl` region (the SMC's ACPI face) at `0x68`–`0x69` is the bank
+the `_PSW` methods write: `EWLO` lid-open (bit 0, what `LID0._PSW` sets),
+`EWLC`, `EWAI`/`EWAR` ac in/out (`ADP1._PSW`), `EWPB` power button, and at
+`0x69` bit 3 **`ENWT`** — the one name in the bank that is not `EW??`, "enable
+wake timer", which nothing in the tables ever sets. `0x6c`–`0x6d` is the same
+layout as *last wake* reasons (`LWWT` included), `0x64`–`0x65` a third copy
+(`SW??`) that reads `cf04` all the time: lid both ways, adapter both ways,
+bits 6–7, and `PM` — and no `WT`. Fedora does not build `ec_sys`, so
+[`tools/ec_poke/`](tools/ec_poke/) is a hundred-line module that exposes
+EC bytes through `/sys/kernel/ec_poke/` via the kernel's own `ec_read()` /
+`ec_write()`.
+
+**`ENWT` is accepted and changes nothing.** [`tools/ec-wake-timer-test.sh`](tools/ec-wake-timer-test.sh)
+sets it (`0x69: 00 -> 08`), arms a plain RTC alarm three minutes ahead, and
+the lid is shut: S3 held for twelve and a half minutes until the lid opened.
+The RTC did fire — `ff_rt_clk` in `/sys/firmware/acpi/interrupts/` shows its
+`STS` bit latched — the SMC just did not act on it, cleared `ENWT` on the way
+out, and reported the lid as the wake reason (`LW = 0100`,
+[`tools/ec-wake-banks.sh`](tools/ec-wake-banks.sh)). The `SW` bank looks like
+the effective mask the SMC keeps for itself, and a write there is refused
+(`0x65: 04 -> 04`).
+
+So the clamshell rule lives inside the SMC, behind keys whose handlers reject
+everything an unprivileged write can offer, and macOS gets through with a
+protocol the ACPI tables do not describe. Without SMC documentation or a
+trace of macOS's SMC traffic on this model there is nowhere left to push, and
+at 0.4–0.5 W a night there is no reason to. Closed.
+
 The suspend part is based on
 [Dunedan/mbp-2016-linux issue #207](https://github.com/Dunedan/mbp-2016-linux/issues/207)
 ("Suspend working with Linux Mint 22.3 on 2016 Macbook (no touch bar)").
@@ -1348,12 +1396,26 @@ and percentage did at that moment; not investigated, they are not needed here.
 backlight — it just does not expose a generic write. One sysfs attribute,
 `battery_charge_limit`, that reads and writes `BCLM` through the driver's own
 `applesmc_read_key()` / `applesmc_write_key()`. The range is 50..100, the same
-window `bclm` allows. Against `drivers/hwmon/applesmc.c` from Linux v7.2:
+window `bclm` allows. Two more attributes, `key_name` and `key_data`, were
+added on 2026-09-23 for the [wake-timer probes below](#sleep-then-hibernate-from-linux-what-the-smc-allows-2026-09-23):
+write a four-letter key name to the first, and the second reads the key as hex
+or writes hex of exactly the key's length; `key_name` reads back the key's
+type, length and the SMC's own read/write flags. Root-only writes, no range
+checks — an instrument, not a feature. Against `drivers/hwmon/applesmc.c` from
+Linux v7.2:
 
 ```diff
---- applesmc.orig.c	2026-09-22 12:06:30.908125151 +0200
-+++ applesmc.c	2026-09-22 12:06:30.931821653 +0200
-@@ -1066,6 +1066,44 @@
+--- drivers/hwmon/applesmc.c (Linux v7.2)
++++ applesmc.c
+@@ -23,6 +23,7 @@
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
++#include <linux/hex.h>
+ #include <linux/timer.h>
+ #include <linux/dmi.h>
+ #include <linux/mutex.h>
+@@ -1066,6 +1067,122 @@
  	return count;
  }
  
@@ -1395,24 +1457,104 @@ window `bclm` allows. Against `drivers/hwmon/applesmc.c` from Linux v7.2:
 +	return count;
 +}
 +
++/*
++ * Generic key access for experiments: write a four-letter key name to
++ * key_name, then read key_data (hex) or write hex of exactly the key's
++ * length to it. Root only for the writes, like every other store here.
++ */
++static char applesmc_sel_key[5];
++
++static ssize_t applesmc_key_name_show(struct device *dev,
++				struct device_attribute *attr, char *sysfsbuf)
++{
++	const struct applesmc_entry *entry;
++
++	if (!applesmc_sel_key[0])
++		return sysfs_emit(sysfsbuf, "\n");
++	entry = applesmc_get_entry_by_key(applesmc_sel_key);
++	if (IS_ERR(entry))
++		return sysfs_emit(sysfsbuf, "%s (no such key)\n", applesmc_sel_key);
++	/* flags: 0x80 read, 0x40 write, 0x10 func */
++	return sysfs_emit(sysfsbuf, "%s type=%s len=%u flags=0x%02x%s%s\n",
++			  entry->key, entry->type, entry->len, entry->flags,
++			  (entry->flags & 0x80) ? " R" : "",
++			  (entry->flags & 0x40) ? " W" : "");
++}
++
++static ssize_t applesmc_key_name_store(struct device *dev,
++	struct device_attribute *attr, const char *sysfsbuf, size_t count)
++{
++	char name[5];
++
++	if (sscanf(sysfsbuf, "%4s", name) != 1 || strlen(name) != 4)
++		return -EINVAL;
++	memcpy(applesmc_sel_key, name, sizeof(applesmc_sel_key));
++	return count;
++}
++
++static ssize_t applesmc_key_data_show(struct device *dev,
++				struct device_attribute *attr, char *sysfsbuf)
++{
++	const struct applesmc_entry *entry;
++	u8 buf[APPLESMC_MAX_DATA_LENGTH];
++	int ret, i, n = 0;
++
++	if (!applesmc_sel_key[0])
++		return -EINVAL;
++	entry = applesmc_get_entry_by_key(applesmc_sel_key);
++	if (IS_ERR(entry))
++		return PTR_ERR(entry);
++	ret = applesmc_read_entry(entry, buf, entry->len);
++	if (ret)
++		return ret;
++	for (i = 0; i < entry->len; i++)
++		n += sysfs_emit_at(sysfsbuf, n, "%02x", buf[i]);
++	n += sysfs_emit_at(sysfsbuf, n, "\n");
++	return n;
++}
++
++static ssize_t applesmc_key_data_store(struct device *dev,
++	struct device_attribute *attr, const char *sysfsbuf, size_t count)
++{
++	const struct applesmc_entry *entry;
++	u8 buf[APPLESMC_MAX_DATA_LENGTH];
++	size_t hexlen;
++	int ret;
++
++	if (!applesmc_sel_key[0])
++		return -EINVAL;
++	entry = applesmc_get_entry_by_key(applesmc_sel_key);
++	if (IS_ERR(entry))
++		return PTR_ERR(entry);
++	hexlen = strcspn(sysfsbuf, "\n ");
++	if (hexlen != 2 * entry->len || hex2bin(buf, sysfsbuf, entry->len))
++		return -EINVAL;
++	ret = applesmc_write_entry(entry, buf, entry->len);
++	if (ret)
++		return ret;
++	return count;
++}
++
  static struct led_classdev applesmc_backlight = {
  	.name			= "smc::kbd_backlight",
  	.default_trigger	= "nand-disk",
-@@ -1080,6 +1118,8 @@
+@@ -1080,6 +1197,10 @@
  	{ "key_at_index_type", applesmc_key_at_index_type_show },
  	{ "key_at_index_data_length", applesmc_key_at_index_data_length_show },
  	{ "key_at_index_data", applesmc_key_at_index_read_show },
 +	{ "battery_charge_limit", applesmc_battery_charge_limit_show,
 +	  applesmc_battery_charge_limit_store },
++	{ "key_name", applesmc_key_name_show, applesmc_key_name_store },
++	{ "key_data", applesmc_key_data_show, applesmc_key_data_store },
  	{ }
  };
  
-@@ -1415,5 +1455,5 @@
+@@ -1415,5 +1536,5 @@
  module_exit(applesmc_exit);
  
  MODULE_AUTHOR("Nicolas Boichat");
 -MODULE_DESCRIPTION("Apple SMC");
-+MODULE_DESCRIPTION("Apple SMC (with battery_charge_limit / BCLM)");
++MODULE_DESCRIPTION("Apple SMC (with battery_charge_limit / BCLM and key_name/key_data)");
  MODULE_LICENSE("GPL v2");
 ```
 
