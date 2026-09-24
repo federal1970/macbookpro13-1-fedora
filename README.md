@@ -1826,7 +1826,23 @@ its message. Recipients: linux-hwmon@vger.kernel.org, the applesmc maintainer
 Delvare), Cc linux-acpi and linux-kernel. Kernel patches go by plain-text
 e-mail, not pull requests — `git send-email` with a Gmail app password does
 it. Sent on 2026-09-23 16:41 CEST, archived at
-<https://lore.kernel.org/linux-hwmon/20260923144117.295450-1-michi.szpakowski@gmail.com/>; this section will record what the review said.
+<https://lore.kernel.org/linux-hwmon/20260923144117.295450-1-michi.szpakowski@gmail.com/>.
+
+**Review, 2026-09-24:** Lukas Wunner pointed to a series by Jordan Brough
+that had been on the list since 2026-09-13 and does the same thing better:
+[`[PATCH v2 0/2] hwmon: (applesmc) add charge_control_end_threshold support`](https://lore.kernel.org/r/20260918175052.85461-1-jordan@brough.org)
+extends the ACPI battery hooks to SBS batteries (the proper fix for what this
+patch worked around by walking the supplies), uses the same power-supply
+extension, and also drives `BFCL`, the MagSafe LED threshold, which has to sit
+a few percent below `BCLM` or the LED stays amber. Rafael Wysocki had review
+comments on the ACPI half; a v3 is due. This patch was withdrawn in favour of
+that series, with two findings from this machine handed over: the SMC of a
+MacBookPro13,1 has no `BFCL` key at all, so v2's unconditional LED write would
+return `-EINVAL` after the limit had already been applied; and the SMC drops
+writes it does not accept silently, so reading the key back is the only way
+to report failure. The reply is at
+<https://lore.kernel.org/linux-hwmon/20260924094544.324119-1-michi.szpakowski@gmail.com/>.
+The local DKMS module stays until Jordan's series is in a Fedora kernel.
 
 ---
 
