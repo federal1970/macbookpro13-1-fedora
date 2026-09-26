@@ -1846,6 +1846,65 @@ The local DKMS module stays until Jordan's series is in a Fedora kernel.
 
 ---
 
+## Building a test kernel for this machine (2026-09-26)
+
+Needed to give a Tested-by on the charge-limit series (its first patch changes
+the ACPI core, which DKMS cannot touch), and useful for any future kernel
+patch: build the exact Fedora kernel that is running, plus patches, with a
+config trimmed to this machine, install it next to the stock one, boot it, keep
+the stock entry as the default. Scripts in [`tools/kernel-test/`](tools/kernel-test/).
+
+**Sources and config.** `dnf download --source kernel-<nvr>` and `rpm2cpio`
+give the tarball, Fedora's `patch-7.2-redhat.patch` and `Makefile.rhelver`
+(the patch `include`s it; without the copy the build dies at once). The
+config is the running kernel's `/boot/config-*` cut down with
+`make LSMOD=<lsmod snapshot> localmodconfig` to the modules actually loaded —
+205 instead of 4846 — with BTF off (no `pahole` on the laptop), signing keys
+cleared and `LOCALVERSION` **empty in the file**: with it set there *and* on
+the command line the release came out `7.2.7-jordantest-jordantest`. The
+trimmed config is [`laptop.config`](tools/kernel-test/laptop.config).
+
+**Where to build.** On this i5-6360U the trimmed build takes 39 min 30 s
+(129 CPU-minutes). A Fedora 44 VM with 8 vCPUs of a Ryzen 7 7840U did it in
+8 min 12 s, so [`vm-build.sh`](tools/kernel-test/vm-build.sh) does the whole
+thing on a build host and packs `boot/` and `lib/modules/<release>/` into a
+`.tar.zst`. The VM sits behind libvirt NAT on a host that is on Wi-Fi, where a
+bridge is impossible (802.11 refuses a second MAC per client), so the VM keeps
+a reverse SSH tunnel to the laptop from a user-level systemd unit
+(`ssh -N -R 2222:localhost:22`, `Restart=always`, `loginctl enable-linger`),
+and `ssh buildvm` on the laptop is `localhost:2222`. Two things bit on the
+way: Fedora's sshd may only bind ports labelled `ssh_port_t`, so the `-R`
+port needs `semanage port -a -t ssh_port_t -p tcp 2222` on the laptop or
+the forward fails silently; and `sshd` in a Fedora Workstation VM is off by
+default.
+
+**Install.** [`laptop-install.sh`](tools/kernel-test/laptop-install.sh)
+unpacks the tarball, copies the modules, links a local build tree as
+`/lib/modules/<release>/build` so the `kernel-install` DKMS hook can rebuild
+the camera, audio and applesmc modules (they need a tree with the same
+config and release; the tarball carries none), then `kernel-install add`
+builds the initramfs and the boot entry with the parameters from
+`/etc/kernel/cmdline`. `grubby --set-default` afterwards keeps the stock
+kernel as the default.
+
+**The trap that cost a boot.** The first attempt ended in emergency mode:
+LUKS opened, root and swap mounted, then nothing worked. The tarball had been
+unpacked under `/tmp` and `cp -a` had faithfully carried the `user_tmp_t`
+SELinux label onto the whole module tree; after switch-root every `modprobe`
+got `avc: denied { module_load }` — no keyboard, no graphics, 29 denials in
+the journal, which `systemd-modules-load` reported as "Failed to find
+module". `chown -R root:root` and `restorecon -R` on the tree fixed it and are
+now in the script. Neither `kernel-install` nor `dracut` had objected.
+
+**Result.** `7.2.7-jordantest` boots and runs this machine fully: zero
+denials, Wi-Fi, sound, camera, the charge limit, `deep` sleep with the lid,
+and the tunnel to the VM comes back on its own. The one visible difference is
+systemd's `bpf-restrict-fs: Failed to load BPF object` — the price of BTF off,
+harmless. Applying a series now means `vm-build.sh ... patch.mbox`, a few
+minutes of incremental build, the install script, and a reboot.
+
+---
+
 ## My forks
 
 Forked so the patches stay available regardless of upstream merge timing.
