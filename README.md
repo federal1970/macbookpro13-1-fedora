@@ -1842,7 +1842,10 @@ return `-EINVAL` after the limit had already been applied; and the SMC drops
 writes it does not accept silently, so reading the key back is the only way
 to report failure. The reply is at
 <https://lore.kernel.org/linux-hwmon/20260924094544.324119-1-michi.szpakowski@gmail.com/>.
-The local DKMS module stays until Jordan's series is in a Fedora kernel.
+Jordan sent a v3 candidate for testing on 2026-09-29 with both points taken
+(BFCL only if the key exists, BCLM read back) and Rafael's review addressed;
+it passed on this machine, see [the test-kernel chapter](#building-a-test-kernel-for-this-machine-2026-09-26).
+The local DKMS module stays until the series is in a Fedora kernel.
 
 ---
 
@@ -1902,6 +1905,35 @@ and the tunnel to the VM comes back on its own. The one visible difference is
 systemd's `bpf-restrict-fs: Failed to load BPF object` — the price of BTF off,
 harmless. Applying a series now means `vm-build.sh ... patch.mbox`, a few
 minutes of incremental build, the install script, and a reboot.
+
+**The series, tested (2026-09-29).** Jordan Brough's v3 candidate — the two
+patches from the [battery chapter](#upstream), rebased by him onto v7.2.7 —
+built on the VM in 78 s of incremental work and passed everything on this
+machine with the in-tree `applesmc` and the SBS battery: the hook registers
+and unregisters with `modprobe`/`rmmod`, `charge_control_end_threshold`
+takes 20, 21, 50, 99 and 100 and reads them back, refuses 10 and 101
+leaving the value untouched, accepts the same value twice, updates the
+uevent, and reattaches by itself after
+`echo ACPI0002:00 > /sys/bus/platform/drivers/acpi-sbs/unbind` and `bind`
+(on 7.2 the SBS driver is a platform driver; `/sys/bus/acpi/drivers/` is
+empty). No BFCL warning, as this SMC has no such key. Transcript script:
+[`tools/kernel-test/v3-test.sh`](tools/kernel-test/v3-test.sh). Tested-by
+sent.
+
+Getting there cost two more DKMS lessons, both now handled by
+[`laptop-install.sh`](tools/kernel-test/laptop-install.sh). DKMS archives
+the in-tree module it replaces, per kernel; replace the module tree under
+it and a later `dkms remove` restores that stale archive over the new
+module — a control-build `applesmc.ko` landed on top of the one carrying
+the series. And Fedora's `dkms.service` runs `dkms autoinstall` at every
+boot, so the first test on the series kernel silently reloaded the old
+DKMS `applesmc` five seconds after boot; `AUTOINSTALL="no"` in that
+module's `dkms.conf` ends that. The first test run also exposed a bug in
+the withdrawn local driver: it took a plain `get_device()` on the battery
+but dropped it with `power_supply_put()`, which also decrements the
+supply's use count, so two unloads left `BAT0` answering `ENODEV` to every
+property until a reboot. Fixed in the local source; the series has no such
+problem.
 
 ---
 

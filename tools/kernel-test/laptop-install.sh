@@ -9,10 +9,20 @@
 set -euo pipefail
 tarball=${1:?tarball from vm-build.sh}
 buildtree=${2:-}
-release=$(basename "$tarball" .tar.zst)
 tmp=$(mktemp -d)
 tar -C "$tmp" --zstd -xf "$tarball"
-[ -d "$tmp/lib/modules/$release" ] || { echo "no modules for $release in $tarball"; exit 1; }
+# the release is whatever lib/modules/ in the tarball says, not the file name
+release=$(ls "$tmp/lib/modules/" | head -1)
+[ -n "$release" ] && [ -f "$tmp/boot/vmlinuz-$release" ] || { echo "no kernel in $tarball"; exit 1; }
+echo "installing $release"
+# DKMS keeps per-kernel state and an archive of the "original" in-tree module
+# it replaced; if the tree is wiped underneath it, a later `dkms remove`
+# restores that stale archive over the new kernel's module (it did: a
+# control-build applesmc.ko landed on top of the one carrying the series).
+# So forget every DKMS module for this release before replacing the tree.
+for m in $(dkms status 2>/dev/null | awk -F'[,: ]+' -v k="$release" '$3==k {print $1"/"$2}' | sort -u); do
+  dkms remove "$m" -k "$release" >/dev/null 2>&1 || true
+done
 rm -rf "/lib/modules/$release"
 cp -a "$tmp/lib/modules/$release" /lib/modules/
 cp "$tmp/boot/System.map-$release" "$tmp/boot/config-$release" /boot/
@@ -29,6 +39,14 @@ fi
 depmod -a "$release"
 kernel-install add "$release" "$tmp/boot/vmlinuz-$release"
 rm -rf "$tmp"
+# out-of-tree modules this machine needs; applesmc-bclm is deliberately NOT
+# here so the in-tree applesmc (with whatever series is under test) runs
+if [ -n "$buildtree" ]; then
+  for m in facetimehd/0.6.13 snd_hda_macbookpro/0.1; do
+    dkms install --force "$m" -k "$release" || echo "dkms $m failed"
+  done
+  depmod -a "$release"
+fi
 echo "installed $release; entries:"
 ls /boot/loader/entries/ 2>/dev/null || grubby --info=ALL | grep -E '^(kernel|title)'
 echo "reboot and pick $release in GRUB; the stock kernel stays the default"
