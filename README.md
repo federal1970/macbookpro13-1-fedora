@@ -2020,6 +2020,27 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    the patch carries a `Fixes:` on the commit that added the driver and
    `Cc: stable`, as that one did. Sent to linux-input on 2026-10-01:
    <https://lore.kernel.org/linux-input/20261001084154.4703-1-michi.szpakowski@gmail.com/>.
+   An automated review on the list raised two real points. First, the
+   driver's suspend handler queues a caps-lock-off command without waiting
+   for the one in flight, and with the flag the LED core now queues a
+   backlight-off command just before it, so the two could race on the
+   single-slot command queue. Second, the driver saves the backlight level
+   to an EFI variable at power-off so the next boot starts with it, and
+   with the LED core blanking the level at suspend, a power-off from a
+   suspended state (hibernation ends in one) would save "off". v2
+   ([`tools/kernel-test/patches/...-v2.patch`](tools/kernel-test/patches/0001-Input-applespi-turn-the-keyboard-backlight-off-across-suspend-v2.patch))
+   waits for the queue to drain before the caps-lock command and keeps a
+   copy of the last level set while not suspended for the EFI save.
+   **Verified 2026-10-01** on `7.2.7-applespi` rebuilt with v2: the
+   `s2idle` test again with Caps Lock on — backlight dark through the sleep,
+   caps-lock LED off through the sleep and back after, backlight back at
+   200; then a real hibernation with the backlight at 200 and the EFI
+   variable read back after the resume
+   ([`tools/kernel-test/efi-bl-test.sh`](tools/kernel-test/efi-bl-test.sh)):
+   206, which is 200 in the driver's hardware scale (32..255), where v1
+   would have saved 32, "off". v2 sent 2026-10-01 as a reply in the same
+   thread:
+   <https://lore.kernel.org/linux-input/20261001084154.4703-1-michi.szpakowski@gmail.com/T/>.
 3. **`button.lid_init_state=open` as a DMI quirk.** The parameter has been on
    the command line since issue #207. `drivers/acpi/button.c` keeps a table
    of machines that need it (Lenovo, Medion, Insyde); no Apple entry. If the
