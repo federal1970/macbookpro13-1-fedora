@@ -2084,6 +2084,36 @@ compositor's choice (KDE Plasma on Wayland here), not the panel's, so on
 another desktop FBC could come on; on this one the parameter switched
 off something that was already off.
 
+5. **Wi-Fi dead after about one warm reboot in seven.** Reported as "раз на
+   десять перезагрузок нет Wi-Fi, перезагружаюсь ещё раз". The journal has
+   it: of the last 40 boots, six lasted a minute and ended in another
+   reboot, and in all six the card enumerated normally (BARs assigned) but
+   the driver's very first register read came back as all-ones:
+
+   ```
+   brcmfmac: brcmf_chip_recognition: MMIO read failed: 0xffffffff
+   brcmfmac: brcmf_pcie_probe: failed 14e4:43a3
+   ```
+
+   Every one of the six followed a warm reboot (`reboot.target`), none a
+   power-off. The likely mechanism: `brcmfmac` has no `shutdown` handler,
+   so the firmware keeps running on the chip through the reboot, the
+   warm reset does not cut the card's power, and the next kernel's probe
+   starts with a chip-ID read, no reset before it, against whatever state
+   the firmware was left in. Mainline has the same probe and still no
+   `shutdown`. The same failure on a MacBookPro14,1 with the same chip is
+   worked around in
+   [MacBook-14-1-Linux-WiFi-Fix](https://github.com/YoYoStudios/MacBook-14-1-Linux-WiFi-Fix)
+   by removing the device from the PCI bus and rescanning at boot. **In
+   progress:** the fix depends on how much force the chip needs, so the
+   next failed boot gets
+   [`tools/kernel-test/wifi-dead-at-boot.sh`](tools/kernel-test/wifi-dead-at-boot.sh)
+   instead of a reboot: module reload, then a PCI function reset, then
+   remove-and-rescan, stopping at the first that brings the interface
+   back. A plain reload working means a retry in `probe`; a reset being
+   needed means a `shutdown` handler that resets the chip before the
+   reboot, which is what the driver already does on `remove`.
+
 ---
 
 ## My forks
