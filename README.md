@@ -2007,6 +2007,25 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    **Closed as not pursuable here.** The hook keeps unloading the module
    around hibernation, S3 gets a free reload it does not need, and
    `efi_pstore` stays on, it costs nothing.
+   **Reopened 2026-10-01 evening as a bisect**, one hibernation per
+   variant, since a failed one only costs a reboot. Ruled out so far:
+   the module is not in the initramfs; `pm_test=devices` and
+   `disk=test_resume` (a real image written, read back and restored in
+   the same boot,
+   [`tools/kernel-test/hib-bisect.sh`](tools/kernel-test/hib-bisect.sh))
+   both survive with the driver loaded, so the freeze and restore in the
+   image are clean; and a test kernel with a `poweroff` callback that
+   resets the chip before the power-off
+   ([patch](tools/kernel-test/patches/hib-v1-brcmfmac-poweroff-reset.patch))
+   still dies, so the chip's state at power-off is not it either. What is
+   left is the restore path after the boot kernel hands over: `restore`
+   reads a register and either hot-resumes or tears the device down and
+   re-probes it from inside the PM callback. To see it die, a USB Ethernet
+   adapter now carries `netconsole` to a machine on the LAN
+   ([`tools/kernel-test/netconsole-up.sh`](tools/kernel-test/netconsole-up.sh);
+   the receiver must be `socat -u UDP-RECV:6666 STDOUT`, a plain `nc -u -l`
+   locks onto the first sender and drops the rest). Next: a real
+   hibernation with that log, then a variant with `restore` disabled.
 2. **applespi leaves the keyboard backlight on through `s2idle`.** Its
    suspend handler turns off only the caps-lock LED; the backlight LED is
    registered without `LED_CORE_SUSPENDRESUME`, the flag that makes the LED

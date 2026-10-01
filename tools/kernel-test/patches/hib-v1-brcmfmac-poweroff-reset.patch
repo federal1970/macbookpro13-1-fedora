@@ -1,0 +1,46 @@
+From: Michal Szpakowski <michi.szpakowski@gmail.com>
+Subject: [TEST v1] brcmfmac: pcie: reset the chip at hibernation power-off
+
+Bisect step: MacBookPro13,1 powers itself off while restoring from a
+hibernation image taken with brcmfmac loaded; the same image path
+survives disk=test_resume (no power-off). The driver has no poweroff
+callback, so the chip goes into the power-off with its firmware in the
+D3-inform state. Reset it there, the same watchdog reset remove() does.
+
+---
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -2705,11 +2705,33 @@ cleanup:
+ 	return err;
+ }
+ 
++static int brcmf_pcie_pm_poweroff(struct device *dev)
++{
++	struct brcmf_pciedev_info *devinfo;
++	struct brcmf_bus *bus;
++
++	brcmf_dbg(PCIE, "Enter\n");
++
++	bus = dev_get_drvdata(dev);
++	devinfo = bus->bus_priv.pcie->devinfo;
++
++	/*
++	 * The platform is about to lose power with the firmware still
++	 * running in its D3 state. Reset the chip first, as remove() does,
++	 * so that nothing is left running on it when the machine comes back.
++	 */
++	brcmf_err(bus, "hibernation power-off: resetting the chip\n");
++	brcmf_pcie_reset_device(devinfo);
++
++	return 0;
++}
++
+ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
+ 	.suspend = brcmf_pcie_pm_enter_D3,
+ 	.resume = brcmf_pcie_pm_leave_D3,
+ 	.freeze = brcmf_pcie_pm_enter_D3,
+ 	.restore = brcmf_pcie_pm_leave_D3,
++	.poweroff = brcmf_pcie_pm_poweroff,
+ };
+ 
+ 
