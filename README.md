@@ -2045,7 +2045,18 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    the command line since issue #207. `drivers/acpi/button.c` keeps a table
    of machines that need it (Lenovo, Medion, Insyde); no Apple entry. If the
    lid reads closed at boot without the parameter, MacBookPro13,1 belongs in
-   that table — ten lines.
+   that table — ten lines. **Closed 2026-10-01: not needed.** One boot of
+   7.2.7 without the parameter, in `multi-user.target` so nothing could
+   react to a wrong answer
+   ([`tools/kernel-test/params-test.sh`](tools/kernel-test/params-test.sh)):
+   the kernel's default (`method`, ask `_LID` at boot, which here reads the
+   EC's lid switch) reported `open` with the lid open, and the journal has
+   no `Lid closed` event. Issue #207 listed the parameter in a bundle
+   without saying what it fixed; whatever it was, this kernel does not
+   need it. The parameter stays on the command line for now out of
+   caution, a false "closed" at boot would suspend with the lid open,
+   and that is the one sleep this machine must not do; a few more boots
+   without it decide.
 4. **NVMe controller 106b:2003.** It is in the quirk table with no quirks,
    while this machine runs with `nvme.noacpi=1` and
    `nvme_core.default_ps_max_latency_us=0`. Either they are no longer
