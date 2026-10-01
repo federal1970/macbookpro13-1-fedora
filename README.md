@@ -2018,7 +2018,8 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    are back at 200 on wake ([`tools/kernel-test/kbd-backlight-test.sh`](tools/kernel-test/kbd-backlight-test.sh)).
    The same fix went into the HID driver for T2 Macs in April 2026, so
    the patch carries a `Fixes:` on the commit that added the driver and
-   `Cc: stable`, as that one did. Sent to linux-input.
+   `Cc: stable`, as that one did. Sent to linux-input on 2026-10-01:
+   <https://lore.kernel.org/linux-input/20261001084154.4703-1-michi.szpakowski@gmail.com/>.
 3. **`button.lid_init_state=open` as a DMI quirk.** The parameter has been on
    the command line since issue #207. `drivers/acpi/button.c` keeps a table
    of machines that need it (Lenovo, Medion, Insyde); no Apple entry. If the
