@@ -272,8 +272,12 @@ journalctl -k -b | grep -E 'sleep state S3|suspend debug'
 cat /sys/power/pm_test        # must be [none]
 ```
 
-**Result:** USB and Wi-Fi are back after the wake — Wi-Fi because the [sleep hook](#3-wi-fi-after-deep-and-after-hibernation)
-reloads `brcmfmac`, which loses its firmware when the rails go down in S3.
+**Result:** USB and Wi-Fi are back after the wake. Wi-Fi comes back on its
+own: the chip loses its firmware when the rails go down in S3 and `brcmfmac`
+re-probes it on resume (verified without the hook on 2026-10-01, see the
+[backlog](#upstream-backlog)); the [sleep hook](#3-wi-fi-after-deep-and-after-hibernation)
+still reloads it around every sleep, and its real remaining job is to disarm
+`ARPT` again, which any load of `brcmfmac` re-arms.
 
 ---
 
@@ -1949,6 +1953,86 @@ but dropped it with `power_supply_put()`, which also decrements the
 supply's use count, so two unloads left `BAT0` answering `ENODEV` to every
 property until a reboot. Fixed in the local source; the series has no such
 problem.
+
+---
+
+## Upstream backlog
+
+Things this machine has shown that belong in the kernel rather than in this
+file, in the order they are worth doing. Each has a precedent upstream and
+can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this-machine-2026-09-26).
+
+1. **brcmfmac does not come back from `deep` without the reload hook.**
+   The driver's resume path already knows how to re-probe a chip that lost
+   power: it reads the interrupt-mask register and, on zero, tears the
+   device down and probes it again. Here the chip is dead after S3 and Wi-Fi
+   still stays down until [the hook](#3-wi-fi-after-deep-and-after-hibernation)
+   reloads the module. The suspicion is that the register of an unreachable
+   device reads `0xffffffff`, not zero, so the driver takes the hot-resume
+   branch and keeps a firmware that is no longer running. One lid cycle with
+   the hook disabled and PCIe debug output on will tell
+   ([`tools/kernel-test/brcmfmac-diag.sh`](tools/kernel-test/brcmfmac-diag.sh));
+   a fix would reach every 2015–2017 MacBook with a BCM4350/4360 that
+   carries the same workaround. **Checked 2026-10-01: no bug to fix for
+   S3.** With the hook moved out of the way (renaming it inside the
+   directory does not disable it — `systemd-sleep` runs every executable
+   there, which wasted the first attempt), a 14-minute lid sleep on
+   7.2.7-200 came back with the driver re-probing the chip by itself:
+   `brcmf_fw_alloc_request: using brcm/brcmfmac4350c2-pcie` inside the
+   resume, firmware up, interface renamed, connected, 31 networks in a scan.
+   The README's claim that the chip "does not come back on its own" from
+   `deep` had never been tested without the hook — `deep-test.sh` always
+   unloaded the module by hand, and the hook itself was born from a
+   hibernation race under `suspend-then-hibernate`, not from S3. Nothing in
+   `brcmfmac` changed between 7.2.5 and 7.2.7 (two unrelated stable fixes),
+   so this was true all along. What the kernel's own re-probe does leave
+   behind is `ARPT` armed again as a wakeup source, which the hook's
+   pre-phase run of the boot script disarms before the next sleep — that
+   part stays. Hibernation is the other half, and there the unload is
+   not optional: hibernated with `brcmfmac` loaded (hook parked), the
+   machine took the LUKS passphrase on power-on, started restoring the
+   image and powered itself off; the next power-on found the image consumed
+   and booted fresh. Nothing of the dying restore reached the journal and
+   no pstore backend was active to catch it, so what exactly dies —
+   `brcmfmac`'s `restore` callback meeting a chip the firmware has
+   power-cycled, or something downstream of it — is unknown. That is the
+   real kernel bug on this list, and it needs a crash log before anyone can
+   do anything with it. A second attempt with `efi_pstore` switched on
+   (`efi_pstore.pstore_disable=0`; Fedora builds it in but disables it)
+   died the same way and left nothing in pstore: no oops, no panic
+   dump. So whatever kills the restore does it below the kernel's ability
+   to say so — the SMC or the firmware cutting power while the restored
+   kernel reinitialises the chip is the best guess — and without a serial
+   console or a second network path there is no log to send anyone.
+   **Closed as not pursuable here.** The hook keeps unloading the module
+   around hibernation, S3 gets a free reload it does not need, and
+   `efi_pstore` stays on, it costs nothing.
+2. **applespi leaves the keyboard backlight on through `s2idle`.** Its
+   suspend handler turns off only the caps-lock LED; the backlight LED is
+   registered without `LED_CORE_SUSPENDRESUME`, the flag that makes the LED
+   core switch it off at suspend and restore it on resume. One line; to be
+   verified in `s2idle`, since `deep` cuts the power anyway. **Verified
+   2026-10-01:** 30 s of `s2idle` with the lid open and the backlight at
+   200/255 — on the stock 7.2.7-200 the keys stay lit through the sleep,
+   on `7.2.7-applespi` with the one-line patch they go dark at suspend and
+   are back at 200 on wake ([`tools/kernel-test/kbd-backlight-test.sh`](tools/kernel-test/kbd-backlight-test.sh)).
+   The same fix went into the HID driver for T2 Macs in April 2026, so
+   the patch carries a `Fixes:` on the commit that added the driver and
+   `Cc: stable`, as that one did. Sent to linux-input.
+3. **`button.lid_init_state=open` as a DMI quirk.** The parameter has been on
+   the command line since issue #207. `drivers/acpi/button.c` keeps a table
+   of machines that need it (Lenovo, Medion, Insyde); no Apple entry. If the
+   lid reads closed at boot without the parameter, MacBookPro13,1 belongs in
+   that table — ten lines.
+4. **NVMe controller 106b:2003.** It is in the quirk table with no quirks,
+   while this machine runs with `nvme.noacpi=1` and
+   `nvme_core.default_ps_max_latency_us=0`. Either they are no longer
+   needed, which cleans this file, or they are, and the controller deserves
+   the quirk the MacBook8,1 one already has. A boot without them plus a few
+   sleep cycles decides.
+
+Not for upstream, but worth the same test: whether `pci=noaer` and
+`i915.enable_fbc=0` still earn their place.
 
 ---
 

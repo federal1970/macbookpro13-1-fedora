@@ -1,0 +1,35 @@
+From: Michal Szpakowski <michi.szpakowski@gmail.com>
+Subject: [PATCH] Input: applespi - turn the keyboard backlight off across suspend
+
+The keyboard backlight of the SPI topcase stays lit through s2idle: the
+driver's suspend handler only switches the caps-lock LED off, and the
+backlight LED is registered without LED_CORE_SUSPENDRESUME, so the LED
+core never gets to blank it. Under deep (S3) the rails go down anyway,
+which is why it only shows on machines that default to s2idle.
+
+Set the flag. The LED core then sets the brightness to 0 before the
+device suspends and restores the previous level on resume; the LED is a
+child of the SPI device, so the command goes out before applespi_suspend()
+drains its writes and disables the GPE.
+
+Tested on a MacBookPro13,1 (2016): 30 s of s2idle with the backlight at
+200/255 leaves it lit on the stock kernel; with the flag it goes dark at
+suspend and is back at 200 on wake.
+
+Fixes: 038b1a05eae6 ("Input: add Apple SPI keyboard and trackpad driver")
+Cc: stable@vger.kernel.org
+Signed-off-by: Michal Szpakowski <michi.szpakowski@gmail.com>
+---
+ drivers/input/keyboard/applespi.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/input/keyboard/applespi.c
++++ b/drivers/input/keyboard/applespi.c
+@@ -1772,6 +1772,7 @@
+ 	applespi->backlight_info.name            = "spi::kbd_backlight";
+ 	applespi->backlight_info.default_trigger = "kbd-backlight";
+ 	applespi->backlight_info.brightness_set  = applespi_set_bl_level;
++	applespi->backlight_info.flags           = LED_CORE_SUSPENDRESUME;
+ 
+ 	sts = devm_led_classdev_register(&spi->dev, &applespi->backlight_info);
+ 	if (sts)
