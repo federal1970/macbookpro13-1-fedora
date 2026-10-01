@@ -147,7 +147,7 @@ The suspend part is based on
 ### 1. Kernel parameters
 
 ```bash
-sudo grubby --update-kernel=ALL --args="button.lid_init_state=open pci=noaer i915.enable_fbc=0 mem_sleep_default=deep"
+sudo grubby --update-kernel=ALL --args="button.lid_init_state=open mem_sleep_default=deep"
 ```
 
 `mem_sleep_default=deep` selects S3. Issue #207 and every earlier revision of this
@@ -2066,7 +2066,23 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    ```
 
 Not for upstream, but worth the same test: whether `pci=noaer` and
-`i915.enable_fbc=0` still earn their place.
+`i915.enable_fbc=0` still earn their place. **`pci=noaer` dropped
+2026-10-01:** the firmware hands AER to Linux (`_OSC: OS assumes control
+of [... AER ...]`), but the three PCH root ports (`00:1c.0`, `00:1c.4`,
+`00:1d.1`) have no AER capability at all, only the devices below them do,
+and error messages from those have nowhere to land. The kernel's `aer`
+port service binds to nothing, so no AER handler ever ran here, with the
+parameter or without. Two hours plus an S3 cycle without it: every
+counter zero, no journal lines
+([`tools/kernel-test/aer-fbc-test.sh`](tools/kernel-test/aer-fbc-test.sh)).
+**`i915.enable_fbc=0` dropped the same day:** the same two hours and the
+S3 cycle with the driver's own choice (`enable_fbc=-1`) gave a clean
+screen, no underruns, no flip timeouts. And i915 never engaged it anyway:
+`/sys/kernel/debug/dri/0000:00:02.0/i915_fbc_status` says `FBC disabled:
+pixel format not supported` for the primary plane. The format is the
+compositor's choice (KDE Plasma on Wayland here), not the panel's, so on
+another desktop FBC could come on; on this one the parameter switched
+off something that was already off.
 
 ---
 
