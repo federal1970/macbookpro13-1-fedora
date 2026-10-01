@@ -147,7 +147,7 @@ The suspend part is based on
 ### 1. Kernel parameters
 
 ```bash
-sudo grubby --update-kernel=ALL --args="button.lid_init_state=open nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1 pci=noaer i915.enable_fbc=0 mem_sleep_default=deep"
+sudo grubby --update-kernel=ALL --args="button.lid_init_state=open pci=noaer i915.enable_fbc=0 mem_sleep_default=deep"
 ```
 
 `mem_sleep_default=deep` selects S3. Issue #207 and every earlier revision of this
@@ -2051,7 +2051,19 @@ can be verified with the [test-kernel pipeline](#building-a-test-kernel-for-this
    `nvme_core.default_ps_max_latency_us=0`. Either they are no longer
    needed, which cleans this file, or they are, and the controller deserves
    the quirk the MacBook8,1 one already has. A boot without them plus a few
-   sleep cycles decides.
+   sleep cycles decides. **Closed 2026-10-01 without a boot: both parameters
+   are no-ops here.** `nvme.noacpi=1` only skips the check for a
+   `StorageD3Enable` property in ACPI (or an AMD DMI list), and this
+   firmware has neither, so the driver takes the same path with or without
+   it. `nvme_core.default_ps_max_latency_us=0` limits APST, and the
+   controller reports `apsta: 0`, `npss: 0` (one power state, no autonomous
+   transitions), so `nvme_configure_apst()` returns before it looks at the
+   value. The bare quirk-table entry is right: the controller needs nothing.
+   Dropped from the command line:
+
+   ```bash
+   sudo grubby --update-kernel=ALL --remove-args="nvme.noacpi=1 nvme_core.default_ps_max_latency_us=0"
+   ```
 
 Not for upstream, but worth the same test: whether `pci=noaer` and
 `i915.enable_fbc=0` still earn their place.
