@@ -1845,7 +1845,22 @@ to report failure. The reply is at
 Jordan sent a v3 candidate for testing on 2026-09-29 with both points taken
 (BFCL only if the key exists, BCLM read back) and Rafael's review addressed;
 it passed on this machine, see [the test-kernel chapter](#building-a-test-kernel-for-this-machine-2026-09-26).
-The local DKMS module stays until the series is in a Fedora kernel.
+
+**v3 on the lists, 2026-09-30:**
+[`[PATCH v3 0/3] hwmon: (applesmc) add charge_control_end_threshold support`](https://lore.kernel.org/linux-hwmon/20260930222650.1883805-1-jordan@brough.org/).
+Three patches now — an `acpi_` prefix for the hook API that touches 18
+callers, the unified hooks for Control Method and SBS batteries, and the
+applesmc part — and the applesmc patch carries
+`Tested-by: Michal Szpakowski`, with the cover letter describing this
+machine correctly as an SBS battery without BFCL and quoting the test. The
+code is what was tested here up to renames and comments. Within hours the
+maintainers of three affected drivers had acked the rename for their
+parts, and the list's AI review bot raised two points on the applesmc
+patch that a hwmon maintainer may well repeat: hwmon's rules want secondary
+functionality like this in an auxiliary driver under `drivers/power/supply`
+rather than registered from the hwmon driver, and `hwmon_lock()` instead of
+a private mutex. If that leads to a v4, it will be retested here. The
+local DKMS module stays until the series is in a Fedora kernel.
 
 ---
 
