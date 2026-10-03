@@ -1,0 +1,42 @@
+--- a/patch_cirrus/cirrus_apple.h
++++ b/patch_cirrus/cirrus_apple.h
+@@ -1445,9 +1445,39 @@
+ 	return 0;
+ }
+ 
++static int cs_8409_boot_setup(struct hda_codec *codec);
++
+ static int cs_8409_apple_resume(struct hda_codec *codec)
+ {
++        struct cs8409_apple_spec *spec = codec->spec;
++        unsigned int gpio_mask;
++
+         myprintk("snd_hda_intel: cs_8409_apple_resume\n");
++
++        /*
++         * The CS8409 is configured, and the CS42L83 behind it brought out of
++         * reset, exactly once: cs_8409_boot_setup() at probe. Everything after
++         * that counts on the state surviving sleep, and usually it does. When
++         * the codec loses power in S3 it comes back with every GPIO disabled,
++         * which holds the CS42L83 in reset (GPIO1) and leaves the speakers
++         * silent until the next boot. A healthy codec always has GPIOs
++         * enabled, so an empty GPIO mask is the sign that the state is gone:
++         * run the boot setup again and make the next prepare redo the
++         * stream setup.
++         */
++        gpio_mask = snd_hda_codec_read(codec, codec->core.afg, 0,
++                                       AC_VERB_GET_GPIO_MASK, 0);
++        if (gpio_mask == 0) {
++                codec_info(codec, "codec state lost over suspend, running the boot setup again\n");
++                if (cs_8409_boot_setup(codec) < 0)
++                        codec_err(codec, "boot setup after resume failed\n");
++                spec->headset_phase = 2;
++                spec->play_init = 0;
++                spec->capture_init = 0;
++                spec->play_init_count = 0;
++                spec->capture_init_count = 0;
++        }
++
+         // code copied from default resume ops
+         snd_hda_codec_init(codec);       
+ 	snd_hda_regmap_sync(codec);

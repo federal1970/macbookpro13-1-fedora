@@ -33,7 +33,7 @@ section.
 | NVMe, battery, USB-C | Works out of the box | — |
 | **Suspend / resume** | **Works with the lid shut, `deep` (S3) drains ~0.5 W over a night** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
-| **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409) |
+| **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409), plus [one patch](#speakers-silent-after-sleep--the-driver-never-re-initialises-the-codec-2026-10-03) so the speakers survive a sleep in which the codec loses power |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Works | Nothing to set; the earlier "very low level" note was wrong — see [open issues](#open-issues) |
@@ -999,6 +999,121 @@ From the project README:
 - Suspend behaviour was not tested by the author; the hardware stays permanently
   powered on. That may be one contributor to the
   [4.1 W idle drain](#s2idle-costs-about-41-w) measured here — unverified.
+
+### Speakers silent after sleep — the driver never re-initialises the codec (2026-10-03)
+
+Every so often — a handful of times in two weeks of daily lid sleeps — the
+machine wakes from S3 with no sound: PipeWire plays, the ALSA pointer advances,
+nothing is muted, the codec reports D0, and the speakers stay silent until the
+next reboot. A second sleep does not help, nor does letting the codec
+runtime-suspend and wake.
+
+The codec dump says why. `/proc/asound/card0/codec#0`, healthy against broken:
+
+```
+healthy                                              after the bad resume
+IO[0]: enable=1, dir=0, wake=1, data=1, unsol=1      IO[0]: enable=0 ... data=0
+IO[1]: enable=1, dir=1, wake=0, data=1, unsol=0      IO[1]: enable=0 ... data=0
+IO[2]: enable=1, dir=0                               IO[2]: enable=0
+IO[3]: enable=1, dir=0                               IO[3]: enable=0
+```
+
+`IO[1]` is the CS42L83's reset line (`CS8409_CS42L83_RESET 0x02` in the
+driver). With every GPIO back at its power-on default the companion codec
+sits in reset and nothing analogue comes out. A healthy dump is kept in
+[`audio/`](audio/) to compare against.
+
+And the driver says why nobody fixes it up: all hardware setup happens once, in
+probe (`cs_8409_boot_setup()`); the `.init` callback that runs on every resume
+is, with the debug lines stripped, `return 0`; `resume` is
+`snd_hda_codec_init()` plus a regmap sync. The author's notes are candid about
+it — "Power down/sleep completely unknown and untested". Most nights the codec
+keeps its state through S3 and nobody notices; when it loses power, the state
+is gone for good.
+
+The fix is to notice and redo the boot setup. A healthy codec always has GPIOs
+enabled, so an empty GPIO mask on resume is the sign
+([`audio/snd_hda_macbookpro-resume-boot-setup.patch`](audio/snd_hda_macbookpro-resume-boot-setup.patch)):
+
+```diff
+--- a/patch_cirrus/cirrus_apple.h
++++ b/patch_cirrus/cirrus_apple.h
+@@ -1445,9 +1445,39 @@
+ 	return 0;
+ }
+ 
++static int cs_8409_boot_setup(struct hda_codec *codec);
++
+ static int cs_8409_apple_resume(struct hda_codec *codec)
+ {
++        struct cs8409_apple_spec *spec = codec->spec;
++        unsigned int gpio_mask;
++
+         myprintk("snd_hda_intel: cs_8409_apple_resume\n");
++
++        /*
++         * The CS8409 is configured, and the CS42L83 behind it brought out of
++         * reset, exactly once: cs_8409_boot_setup() at probe. Everything after
++         * that counts on the state surviving sleep, and usually it does. When
++         * the codec loses power in S3 it comes back with every GPIO disabled,
++         * which holds the CS42L83 in reset (GPIO1) and leaves the speakers
++         * silent until the next boot. A healthy codec always has GPIOs
++         * enabled, so an empty GPIO mask is the sign that the state is gone:
++         * run the boot setup again and make the next prepare redo the
++         * stream setup.
++         */
++        gpio_mask = snd_hda_codec_read(codec, codec->core.afg, 0,
++                                       AC_VERB_GET_GPIO_MASK, 0);
++        if (gpio_mask == 0) {
++                codec_info(codec, "codec state lost over suspend, running the boot setup again\n");
++                if (cs_8409_boot_setup(codec) < 0)
++                        codec_err(codec, "boot setup after resume failed\n");
++                spec->headset_phase = 2;
++                spec->play_init = 0;
++                spec->capture_init = 0;
++                spec->play_init_count = 0;
++                spec->capture_init_count = 0;
++        }
++
+         // code copied from default resume ops
+         snd_hda_codec_init(codec);       
+ 	snd_hda_regmap_sync(codec);
+```
+
+```bash
+cd ~/snd_hda_macbookpro && git apply ~/dev/macbookpro13-1-fedora/audio/snd_hda_macbookpro-resume-boot-setup.patch
+sudo dkms remove snd_hda_macbookpro/0.1 --all && sudo dkms install snd_hda_macbookpro/0.1
+sudo reboot        # this driver cannot be reloaded live, see below
+```
+
+**Verified by provoking the failure.** `hda-verb` (package `alsa-tools`) can put
+the codec into its power-on state on demand — an HDA function-group reset,
+twice, as the specification wants:
+
+```bash
+sudo hda-verb /dev/snd/hwC0D0 0x01 0x7ff 0
+sudo hda-verb /dev/snd/hwC0D0 0x01 0x7ff 0
+```
+
+Lid shut for a minute, lid open: the kernel log has
+`codec state lost over suspend, running the boot setup again`, the dump is
+identical to the healthy one, and the speakers play. Two things learned on the
+way there:
+
+- **Zeroing only the GPIO mask is not a valid test.** The boot setup is written
+  for a codec fresh out of reset; run on one that was merely poked, it restored
+  the GPIOs, drew an interrupt storm from the CS42L83 the handler could not
+  drain (`UNKNOWN INTERRUPT`, `max count exceeded`), and left the speakers
+  silent. The patch only triggers on an empty mask, which a live codec never
+  has, so this cannot happen by itself.
+- **Do not unbind and rebind `snd_hda_intel`.** The out-of-tree codec driver
+  fails to probe the second time (`probe ... failed with error -22`, a WARNING
+  in `hda_codec_driver_probe`), the generic driver takes the codec with no
+  outputs, and only HDMI devices remain. `reconfig` in sysfs is refused with
+  `EBUSY`. Before the patch a reboot was the only way back.
+
+What a provoked reset cannot show is the real thing; the first natural
+occurrence will, and it will leave that line in `journalctl -k`.
 
 ---
 
@@ -2154,7 +2269,7 @@ Forked so the patches stay available regardless of upstream merge timing.
 |---|---|---|
 | [federal1970/facetimehd](https://github.com/federal1970/facetimehd) | [juicecultus/facetimehd](https://github.com/juicecultus/facetimehd) | FaceTime HD driver, **includes the kernel 7.2 `strscpy` fix and the buffer timestamp fix** |
 | [federal1970/facetimehd-firmware](https://github.com/federal1970/facetimehd-firmware) | [patjak/facetimehd-firmware](https://github.com/patjak/facetimehd-firmware) | Camera firmware extraction, used unmodified |
-| [federal1970/snd_hda_macbookpro](https://github.com/federal1970/snd_hda_macbookpro) | [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) | Cirrus CS8409 audio driver, used unmodified |
+| [federal1970/snd_hda_macbookpro](https://github.com/federal1970/snd_hda_macbookpro) | [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) | Cirrus CS8409 audio driver, with [one local patch](#speakers-silent-after-sleep--the-driver-never-re-initialises-the-codec-2026-10-03) for resume |
 
 ---
 
