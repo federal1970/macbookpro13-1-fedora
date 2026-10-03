@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# cs8409-dev - root helper for developing the in-kernel Apple CS8409 support.
+#
+# Installed root-owned in /usr/local/sbin and run by hand with sudo. One of its
+# actions loads a kernel module built in the user's home directory, which is
+# arbitrary code in the kernel, so it is deliberately not given a passwordless
+# sudoers rule.
+#
+#   cs8409-dev swap     unload the HDA stack, load the test codec module from
+#                       $KO, load the controller driver again
+#   cs8409-dev unload   unload the HDA stack and leave it unloaded
+#   cs8409-dev stock    unload the HDA stack and load the installed modules
+#                       (whatever depmod resolves: the DKMS driver in extra/)
+#   cs8409-dev verb NID VERB PARAM
+#                       hda-verb on the Cirrus codec (hwC0D0)
+#   cs8409-dev dump     print /proc/asound/card0/codec#0 (wakes the codec)
+#   cs8409-dev dyndbg on|off
+#                       dynamic debug for the codec module
+#
+# The caller stops PipeWire first (systemctl --user), this script does not.
+set -u
+
+KO=/home/user/dev/cs8409-apple/out/snd-hda-codec-cs8409.ko
+CODECS="snd_hda_codec_cs8409 snd_hda_codec_intelhdmi snd_hda_codec_hdmi snd_hda_codec_generic snd_hda_scodec_component"
+
+unload_stack() {
+	# alsactl's state daemon runs as root and keeps the control device open,
+	# which pins snd_hda_intel (and makes hwC0D0/reconfig return EBUSY). It is
+	# left stopped while a test module is loaded, so that it does not restore
+	# a mixer state saved for another driver; "stock" starts it again.
+	systemctl stop alsa-state.service 2>/dev/null
+	# Controller first: the codecs hang off its bus.
+	modprobe -r snd_hda_intel 2>&1 || {
+		echo "cannot unload snd_hda_intel, refcnt $(cat /sys/module/snd_hda_intel/refcnt 2>/dev/null); open sound devices:"
+		fuser -v /dev/snd/* 2>&1 | grep -vE '^\s*USER'
+		return 1
+	}
+	for m in $CODECS; do
+		modprobe -r "$m" 2>/dev/null
+	done
+	lsmod | grep -qE '^snd_hda_codec_cs8409' && { echo "codec module still loaded"; return 1; }
+	return 0
+}
+
+case "${1:-}" in
+swap)
+	[ -f "$KO" ] || { echo "no module at $KO"; exit 1; }
+	unload_stack || exit 1
+	# dependencies of the codec module, then the module itself by path
+	modprobe snd_hda_codec_generic || exit 1
+	modprobe snd_hda_scodec_component 2>/dev/null
+	insmod "$KO" || exit 1
+	modprobe snd_hda_intel || exit 1
+	echo "loaded: $(modinfo -F srcversion "$KO") from $KO"
+	;;
+unload)
+	unload_stack
+	;;
+stock)
+	unload_stack || exit 1
+	modprobe snd_hda_intel
+	systemctl start alsa-state.service 2>/dev/null
+	;;
+verb)
+	[ $# -eq 4 ] || { echo "usage: cs8409-dev verb NID VERB PARAM"; exit 1; }
+	exec hda-verb /dev/snd/hwC0D0 "$2" "$3" "$4"
+	;;
+dump)
+	exec cat '/proc/asound/card0/codec#0'
+	;;
+dyndbg)
+	case "${2:-}" in
+	on)  echo 'module snd_hda_codec_cs8409 +p' > /sys/kernel/debug/dynamic_debug/control ;;
+	off) echo 'module snd_hda_codec_cs8409 -p' > /sys/kernel/debug/dynamic_debug/control ;;
+	*)   echo "usage: cs8409-dev dyndbg on|off"; exit 1 ;;
+	esac
+	;;
+*)
+	sed -n '2,24p' "$0"
+	exit 1
+	;;
+esac
