@@ -1,4 +1,4 @@
-From 5302fd86538ab7ac0fb8521cb9df8e0b389b68d4 Mon Sep 17 00:00:00 2001
+From 90b864f9c91b2312a63d63f3b9ac87beedc03a68 Mon Sep 17 00:00:00 2001
 From: Michal Szpakowski <michi.szpakowski@gmail.com>
 Date: Sun, 4 Oct 2026 20:09:22 +0200
 Subject: [RFC PATCH 3/3] ALSA: hda/cs8409: Add support for Apple
@@ -108,11 +108,12 @@ Fedora's 7.2.8: speakers, speaker volume, headphones and headset
 microphone (Koss Porta Pro with microphone), internal microphone, plug
 and unplug with a stream running and with the codec runtime suspended,
 playback started from idle, S3 (deep) from idle and under a running
-stream.
+stream, hibernation with the speakers in use and with a headset plugged
+in.
 
-Not tested: s2idle and hibernation. Not handled: headset buttons;
-sample rates other than 44.1 kHz. The CS8409's PLLs and serial ports
-stay enabled while the codec is in D3.
+Not tested: s2idle. Not handled: headset buttons; sample rates other
+than 44.1 kHz. The CS8409's PLLs and serial ports stay enabled while the
+codec is in D3.
 
 Assisted-by: Claude:claude-fable-5-1
 ---

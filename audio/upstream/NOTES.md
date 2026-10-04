@@ -208,7 +208,10 @@ line stuck, and a whole mechanism had been built on it.
 Run on the hardware on the final sources: headphones from idle, plug and
 unplug under a stream and in standby (each plug detected once, with the
 microphone), volume keys, S3 under music (one detection, no `PDN_DONE`
-timeout), both microphones. s2idle and hibernation are not tested.
+timeout), both microphones. Hibernation, three cycles on the same sources
+installed through DKMS: sound in the speakers afterwards, and in the headphones
+when the machine was hibernated with the headset plugged in; nothing from the
+driver in the kernel log. s2idle is not tested.
 
 The driver is in use here through DKMS: `~/dev/cs8409-mbp131-dkms` holds the
 three files and the private HDA headers of Linux 7.2, which `kernel-devel`
