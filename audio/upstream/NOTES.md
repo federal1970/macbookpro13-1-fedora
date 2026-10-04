@@ -65,9 +65,9 @@ coefficients 0x6b/0x71 are for (not needed for sound).
 
 ## 2026-10-03, later: phase 2, CS42L83 — headphones, jack, internal mic
 
-Working tree at `0246a07`; the diff against the unmodified 7.2 driver is kept
-here as [`cs8409-mbp131-wip.patch`](cs8409-mbp131-wip.patch). It is work in
-progress: debug prints and two experiments are still in it.
+Working tree at `0246a07`; the diff against the unmodified 7.2 driver was kept
+here as `cs8409-mbp131-wip.patch` until the series of 2026-10-04 replaced it
+([`series-rfc-v1/`](series-rfc-v1)).
 
 The CS42L83 is sub-codec 0 and goes through the driver's existing `cs42l42_*`
 code. Its init table is the Dell CS42L42 one with AppleHDA's 44.1 kHz clocking
@@ -118,3 +118,59 @@ Open:
   mic at init and without one on a live plug. AppleHDA waits 1.8 s after the
   tip sense before detecting the type.
 - Headset microphone not tested. Speaker volume control, 48 kHz: not done.
+
+## 2026-10-04: everything works; an RFC series
+
+State: [`series-rfc-v1/`](series-rfc-v1), two patches
+against `tiwai/sound.git` for-next (`12455e2b8`, whose three cs8409 files are
+those of 7.2). Patch 2 is the tree that was tested, byte for byte. Working
+tree `~/dev/cs8409-apple`: `master` is the clean code, the branch `diag` the
+same logic with the instruments below. checkpatch `--strict`: nothing on
+patch 1, four CamelCase checks on existing coefficient names on patch 2. The
+patches carry `Assisted-by` and no `Signed-off-by`: the kernel's
+`coding-assistants.rst` leaves that to the human who sends them.
+
+Every "open" point of the section above is closed, and the five failed attempts
+listed there proved nothing: they were all made in a state the first row of
+this table explains.
+
+| symptom | cause | fix |
+|---|---|---|
+| a plug with the codec idle is not noticed | the HDA core drops unsolicited responses until the card is registered (`snd_hdac_bus_process_unsol_events`, `codec->registered`); the jack detection run from the build action raises its interrupt before that, nobody reads the CS42L83 status, GPIO 0 stays low and no later event makes an edge. Every idle test had been made right after a module load, in that state | a delayed work looks at the line once responses get through. Runtime suspend then works in its plainest form: CS42L83 in standby, tip sense interrupt of `0x1b79` armed, unsolicited response left on, function group in D3 |
+| after S3 the CS42L83 reads as zeroes at the first init, and answers at the next | `spec->dev_addr` caches the CS8409 I2C address register and is never invalidated; the register is lost with the power. In-tree code | forget the cache on suspend (patch 1) |
+| headphones right for one stream, distorted for the next | PLL and `SCLK_PRESENT` set once at init, Dell style; the serial port carries 44.1 kHz in a 48 kHz frame through the SRCs | blocks, PLL and clock switch per stream, at prepare and cleanup, as the ASoC cs42l42 driver and AppleHDA do |
+| speakers for a fraction of a second and crackles at every start from idle | each runtime resume reset the CS42L83 and ran the type detection under the starting stream | standby keeps the jack state; the resume only undoes the standby and compares the tip sense. Full init only for the first init, after S3 (GPIO mask gone) and after a system suspend (reset line low) |
+| headphones silent for a whole stream, about one S3 under music in three | `ASP_RX_DAI0_EN` was set before the switch from the oscillator to the bit clock; the receive side sometimes stayed deaf | enable the serial port channels after the clock switch, clear them at cleanup. 11 S3 cycles under music without a failure afterwards |
+| "Timeout waiting for PDN_DONE" at a system suspend under a stream | the PLL still running when `cs42l42_suspend()` powers the ADC and HP down, which `cs42l42.h` forbids | stop the PLL first |
+| an unplug in standby is noticed only at the next resume | the interrupt wakes the codec, but the debounced level in `0x1b77` reads "present" for about 0.47 s more | on the way out of standby the latched status (`0x1b7b`, an alias of `0x1309`) says what happened, and the level is polled until it follows |
+
+Also new: `Speaker Playback Volume` on the SSM3515 digital volume, 0.375 dB a
+step, stopping at the −3 dB AppleHDA programs; the headset microphone works
+(clean voice); the internal microphone is picked by the generic auto-mic, so
+only with no headset microphone plugged.
+
+Checked by ear and by the logs on the final build: speakers and their volume,
+headphones from idle (6 of 6), plug and unplug under a stream and in standby,
+both microphones, S3 from idle and under a stream, the volume keys.
+
+Known limits: 44.1 kHz only; no headset buttons; the type detection, which is
+the driver's existing cs42l42 code, took the headset for headphones 3 times in
+about 30 plugs (AppleHDA waits 1.8 s before detecting).
+
+How the last three rows were found, since nothing in the registers differed
+between the good and the bad state:
+
+- `/proc/asound/card0/cs42l83`: the CS42L83 registers, the CS8409 coefficients
+  and the amps, readable without root (branch `diag`).
+- Two debug controls that write one CS42L83 register or one CS8409 coefficient
+  from user space (`amixer cset iface=CARD,name='L83 Poke Debug' reg,val`).
+- A split by ear: with the ADC mixed into the headphone mixer
+  (`MIXER_ADC_VOL` := 0) the user heard himself in the silent state, so the
+  amplifier was alive and the music was not arriving.
+- Five single writes nine seconds apart, each announced on screen with
+  `notify-send`; the music came back at the first, `ASP_RX_DAI0_EN` off and on.
+- A pitfall of the development loop itself: stopping and starting PipeWire
+  around each module swap leaves KDE's `kded6` with a stale view of the sink,
+  and the volume keys then move between two values only.
+  `systemctl --user restart plasma-kded6.service` after a swap.
+
