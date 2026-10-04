@@ -213,6 +213,7 @@ installed through DKMS: sound in the speakers afterwards, and in the headphones
 when the machine was hibernated with the headset plugged in; nothing from the
 driver in the kernel log. s2idle is not tested.
 
-The driver is in use here through DKMS: `~/dev/cs8409-mbp131-dkms` holds the
-three files and the private HDA headers of Linux 7.2, which `kernel-devel`
-does not ship; `dkms.conf` therefore refuses any other kernel series.
+The driver is in use here through DKMS:
+[`../cs8409-mbp131-dkms`](../cs8409-mbp131-dkms) holds the three files and the
+private HDA headers of Linux 7.2, which `kernel-devel` does not ship;
+`dkms.conf` therefore refuses any other kernel series.

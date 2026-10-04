@@ -33,7 +33,7 @@ section.
 | NVMe, battery, USB-C | Works out of the box | — |
 | **Suspend / resume** | **Works with the lid shut, `deep` (S3) drains ~0.5 W over a night** | [Kernel parameters + boot-time script](#sleep-and-hibernation); `s2idle` costs 4 W and S0ix is out of reach, so the default sleep is `deep` since 2026-09-21 |
 | **Hibernation** | **Works** | [Swap file, `resume=`, and a `brcmfmac` sleep hook](#hibernation--the-intended-solution). Resume on LUKS works; the passphrase is asked for at power-on |
-| **Audio (Cirrus CS8409)** | **Fixed** | [Out-of-tree DKMS driver](#audio-cirrus-cs8409), plus [upstream PR #220](#speakers-silent-after-sleep--the-driver-never-re-initialises-the-codec-2026-10-03) so the speakers survive sleep |
+| **Audio (Cirrus CS8409)** | **Works** | [The in-tree driver with a new board for this Mac, built through DKMS](#audio-cirrus-cs8409): speakers, headphones, both microphones, jack detection, sleep and hibernation. Three patches meant for mainline |
 | **Camera (FaceTime HD)** | **Fixed** | [Firmware extraction + DKMS driver + two source fixes](#camera-facetime-hd): a kernel 7.2 build error and missing buffer timestamps. Firefox needs [one pref](#6-firefox-notfounderror-with-a-camera-that-works) on top |
 | Caps Lock as layout switch | Configurable | [keyd](#caps-lock-as-a-layout-switch) |
 | Microphone | Works | Nothing to set; the earlier "very low level" note was wrong — see [open issues](#open-issues) |
@@ -963,8 +963,140 @@ own activity. So there is no idle-power argument for loading it.
 
 ## Audio (Cirrus CS8409)
 
-Driver: [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro)
-· [my fork](https://github.com/federal1970/snd_hda_macbookpro)
+The sound hardware is an HDA codec Cirrus CS8409 (subsystem `106b:3300`) that
+is mostly a bridge: behind its I2C bus sit a CS42L83 for the headset jack and
+four SSM3515 amplifiers for the speakers. The kernel's own driver for the chip,
+`snd-hda-codec-cs8409`, knows Dell boards only. On this Mac it binds and finds
+no outputs and no inputs, only HDMI.
+
+Since 2026-10-04 this machine runs that in-tree driver with a new board for the
+MacBookPro13,1 added to it: three patches
+([`audio/upstream/series-rfc-v1`](audio/upstream/series-rfc-v1)), built as a
+DKMS module from [`audio/cs8409-mbp131-dkms`](audio/cs8409-mbp131-dkms). The
+register values come from
+[davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro),
+the out-of-tree driver [used here before](#before-2026-10-04-the-out-of-tree-replay-driver).
+
+| | |
+|---|---|
+| Speakers | Work, with a hardware volume control |
+| Headphones | Work, with a hardware volume control |
+| Jack detection | Works while playing and while the codec sleeps; PipeWire switches the port by itself |
+| Headset microphone | Works (4-pole CTIA headset) |
+| Internal microphone | Works; it is used whenever no headset microphone is plugged in |
+| Sleep (`deep`, S3) | Works from idle and with a stream running |
+| Hibernation | Works, also with a headset plugged in |
+| Power | The codec runtime-suspends when nothing plays; a plug wakes it |
+| Headset buttons | Not handled |
+| Sample rate | 44.1 kHz only; PipeWire resamples everything else |
+| `s2idle` | Not tested |
+
+### Install
+
+```bash
+sudo dnf install dkms kernel-devel gcc make git
+git clone https://github.com/federal1970/macbookpro13-1-fedora.git
+sudo macbookpro13-1-fedora/audio/cs8409-mbp131-dkms/install.sh
+sudo reboot
+```
+
+`install.sh` registers the package with DKMS and builds it for the newest
+installed 7.2 kernel (or for the kernel given as its argument). If
+`snd_hda_macbookpro` is in DKMS it is taken out first; its checkout is left
+alone. The module keeps the in-tree name and goes to `/extra`, which `depmod`
+on Fedora prefers over the kernel's own copy. Nothing is loaded or unloaded by
+the script: the new module takes over at the next boot.
+
+Expected result:
+
+```console
+$ dkms status
+snd-hda-codec-cs8409-mbp131/20261004.f28e349, 7.2.8-200.fc44.x86_64, x86_64: installed (Original modules exist)
+
+$ journalctl -k -b | grep cs8409
+snd_hda_codec_cs8409 hdaudioC0D0: CS8409: picked fixup  for codec SSID 106b:3300
+snd_hda_codec_cs8409 hdaudioC0D0: autoconfig for CS8409: line_outs=2 (0x24/0x25/0x0/0x0/0x0) type:speaker
+snd_hda_codec_cs8409 hdaudioC0D0:    hp_outs=1 (0x2c/0x0/0x0/0x0/0x0)
+snd_hda_codec_cs8409 hdaudioC0D0:    inputs:
+snd_hda_codec_cs8409 hdaudioC0D0:      Internal Mic=0x44
+snd_hda_codec_cs8409 hdaudioC0D0:      Mic=0x3c
+
+$ aplay -l | grep CS8409
+card 0: PCH [HDA Intel PCH], device 0: CS8409/CS42L83 Analog [CS8409/CS42L83 Analog]
+```
+
+**Kernel updates.** The driver includes private HDA headers that `kernel-devel`
+does not ship, so the package carries those of Linux 7.2 and `dkms.conf`
+refuses to build for any other series (`BUILD_EXCLUSIVE_KERNEL="^7\.2\."`).
+Within 7.2 DKMS rebuilds the module for each new kernel by itself. On a 7.3
+kernel the package does not build, the kernel's own module loads, and there is
+no sound until the headers under `hda/` are refreshed from that kernel's source
+and the three patches applied to its `cs8409*.c`.
+
+### Use
+
+Nothing to configure. PipeWire picks the profile **Analog Stereo Duplex** and
+offers two output ports, Speakers and Headphones, and two input ports, Internal
+Microphone and Microphone; it follows the jack between them.
+
+| mixer control | what it is |
+|---|---|
+| `Speaker Playback Volume` | the SSM3515 digital volume, 0.375 dB a step. It stops at −3 dB, the level AppleHDA programs: the driver has no speaker protection, so it does not go above what macOS uses |
+| `Headphone Playback Volume` | the CS42L83 output volume |
+| `Mic Capture Volume` | the headset microphone |
+| `Internal Mic Capture Volume`, `Internal Mic Boost Volume` | the internal microphone |
+
+The speaker PCM is stereo: both speaker pairs carry the same left and right.
+
+### What was checked
+
+All by ear on this machine and against the kernel log, on the sources that are
+in the package:
+
+- speakers and their volume, the volume keys;
+- headphones started from an idle codec, with no click and no sound from the
+  speakers first;
+- plug and unplug under a running stream and with the codec runtime-suspended:
+  each plug detected once, the headset recognised with its microphone 33 times
+  out of 33;
+- headset microphone and internal microphone, voice recorded and played back;
+- S3 from idle, and S3 with music playing in the headphones, 11 cycles;
+- hibernation, three cycles: speakers afterwards, and headphones when the
+  machine was hibernated with the headset in.
+
+The codec loses every register in S3 on this machine, so each system resume
+programs it from scratch. A runtime resume does not: when nothing plays, the
+CS42L83 is left out of reset and powered down with its tip sense interrupt
+armed, the amplifiers are off and the function group is in D3; a plug or an
+unplug wakes the codec through an unsolicited response. The CS8409's own PLLs
+and serial ports stay enabled in that state.
+
+### How it was made, and upstream
+
+- [`audio/upstream/decode-106b3300.md`](audio/upstream/decode-106b3300.md):
+  the replay driver's sequences for this subsystem, read down to the register
+  level.
+- [`audio/upstream/NOTES.md`](audio/upstream/NOTES.md): the working notes, with
+  every symptom met on the way, its cause and its fix.
+- [`audio/upstream/series-rfc-v1`](audio/upstream/series-rfc-v1): three patches
+  against `tiwai/sound.git` for-next. The first makes the common code forget a
+  cached I2C address over suspend, the second adds a flag for a debounced tip
+  sense to the shared CS42L42 code, the third is the board. The series has not
+  been sent to the list yet.
+- [`audio/upstream/cs8409-dev`](audio/upstream/cs8409-dev): the helper that
+  swaps the module live during development.
+
+The board is picked by the codec subsystem ID, which the replay driver uses
+for the MacBookPro14,1 too. That model is untested.
+
+### Before 2026-10-04: the out-of-tree replay driver
+
+Until then the sound came from
+[davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro)
+([my fork](https://github.com/federal1970/snd_hda_macbookpro)), which replays
+the verb and I2C sequences AppleHDA sends. It covers far more than this model:
+other MacBook Pros and iMacs with a CS8409 and other amplifiers. For those it
+is still the driver to use.
 
 ```bash
 sudo dnf install gcc kernel-devel make patch wget git dkms
@@ -979,33 +1111,20 @@ silently ignores unknown arguments and falls back to a plain install. Removal is
 **A reboot is mandatory.** After `modprobe` the devices show up in `aplay -l`, but
 there is no sound. After a reboot it works.
 
-The module signing error (`SSL error ... signing_key.pem`) is harmless — released
+The module signing error (`SSL error ... signing_key.pem`) is harmless: released
 Fedora kernels ship no signing key, and Secure Boot on this machine does not block
 the unsigned module from loading.
 
-Expected result:
+What it did not do on this machine: the hardware stays powered all the time
+(its README says suspend was never tested), the module cannot be reloaded
+without a reboot, and the codec's setup did not survive sleep, which is the
+next section.
 
-```console
-$ dkms status
-snd_hda_macbookpro/0.1, 7.2.5-200.fc44.x86_64, x86_64: installed (Original modules exist)
-```
+#### Speakers silent after sleep with that driver (2026-10-03)
 
-From the project README:
-
-- The audio profile must be **Analogue Stereo Output**; for the microphone,
-  **Analogue Stereo Duplex**.
-- The microphone is not fully finished — the recording level is very low (as it is
-  under macOS) and needs software amplification.
-- Suspend behaviour was not tested by the author; the hardware stays permanently
-  powered on. That may be one contributor to the
-  [4.1 W idle drain](#s2idle-costs-about-41-w) measured here — unverified.
-
-### Speakers silent after sleep — the driver never re-initialises the codec (2026-10-03)
-
-Every so often — noticed twice in two weeks of daily lid sleeps — the
-machine wakes from S3 with no sound: PipeWire plays, the ALSA pointer advances,
-nothing is muted, the codec reports D0, and the speakers stay silent until the
-next reboot. A second sleep does not help, nor does letting the codec
+The machine wakes from S3 with no sound: PipeWire plays, the ALSA pointer
+advances, nothing is muted, the codec reports D0, and the speakers stay silent
+until the next reboot. A second sleep does not help, nor does letting the codec
 runtime-suspend and wake.
 
 The codec dump says why. `/proc/asound/card0/codec#0`, healthy against broken:
@@ -1026,18 +1145,16 @@ sits in reset and nothing analogue comes out. A healthy dump is kept in
 And the driver says why nobody fixes it up: all hardware setup happens once, in
 probe (`cs_8409_boot_setup()`); the `.init` callback that runs on every resume
 is, with the debug lines stripped, `return 0`; `resume` is
-`snd_hda_codec_init()` plus a regmap sync. The author's notes are candid about
-it — "Power down/sleep completely unknown and untested". The codec loses power
-in S3, comes back blank, and the state is gone until the next boot.
+`snd_hda_codec_init()` plus a regmap sync. The codec loses power in S3, comes
+back blank, and the state is gone until the next boot.
 
 The fix is to notice and redo the boot setup. A healthy codec always has GPIOs
-enabled, so an empty GPIO mask on resume is the sign. **Use
-[davidjo/snd_hda_macbookpro#220](https://github.com/davidjo/snd_hda_macbookpro/pull/220)**
-for that: it was opened the day before this was written, by someone with a
-MacBookPro14,3, does the same thing with the same gate, and does it more
-thoroughly — it also resets the jack and headset state, blocks unsolicited
-events while the codec is being programmed, and checks the result. It is what
-runs here since the evening of 2026-10-03:
+enabled, so an empty GPIO mask on resume is the sign.
+[davidjo/snd_hda_macbookpro#220](https://github.com/davidjo/snd_hda_macbookpro/pull/220),
+opened by someone with a MacBookPro14,3, does that: it also resets the jack and
+headset state, blocks unsolicited events while the codec is being programmed,
+and checks the result. It ran here from the evening of 2026-10-03 until the
+driver was replaced:
 
 ```bash
 cd ~/snd_hda_macbookpro && gh pr diff 220 -R davidjo/snd_hda_macbookpro | git apply
@@ -1059,64 +1176,18 @@ Four sleeps out of four came back with the codec blank and were reprogrammed
 (`cs8409: the codec came back without its setup, programming it again` in
 `journalctl -k`), with no error from the patch. The one blemish: with a headset
 in, the repeated setup logs `button detect - FAILED TO GET INTERRUPT`; playback
-is fine, the headset's buttons and microphone were not checked. In all
-likelihood every sleep on this machine has always lost the setup, as it does
-on the MacBookPro14,3 the patch was written on: the silence was noticed only
-twice in the two weeks Linux has been on this Mac because sound was not checked
-after every sleep and the machine was rebooted often.
+is fine. Every sleep on this machine loses the setup, as on the MacBookPro14,3
+the patch was written on. The silence had been noticed only twice in two weeks
+because sound was not checked after every sleep and the machine was rebooted
+often.
 
-The patch written here that morning, before #220 turned up, is the same idea in
-its smallest form and is kept for the record
+A smaller patch with the same idea was written here the morning before #220
+turned up and is kept for the record
 ([`audio/snd_hda_macbookpro-resume-boot-setup.patch`](audio/snd_hda_macbookpro-resume-boot-setup.patch));
-there is no reason to prefer it:
-
-```diff
---- a/patch_cirrus/cirrus_apple.h
-+++ b/patch_cirrus/cirrus_apple.h
-@@ -1445,9 +1445,39 @@
- 	return 0;
- }
- 
-+static int cs_8409_boot_setup(struct hda_codec *codec);
-+
- static int cs_8409_apple_resume(struct hda_codec *codec)
- {
-+        struct cs8409_apple_spec *spec = codec->spec;
-+        unsigned int gpio_mask;
-+
-         myprintk("snd_hda_intel: cs_8409_apple_resume\n");
-+
-+        /*
-+         * The CS8409 is configured, and the CS42L83 behind it brought out of
-+         * reset, exactly once: cs_8409_boot_setup() at probe. Everything after
-+         * that counts on the state surviving sleep, and usually it does. When
-+         * the codec loses power in S3 it comes back with every GPIO disabled,
-+         * which holds the CS42L83 in reset (GPIO1) and leaves the speakers
-+         * silent until the next boot. A healthy codec always has GPIOs
-+         * enabled, so an empty GPIO mask is the sign that the state is gone:
-+         * run the boot setup again and make the next prepare redo the
-+         * stream setup.
-+         */
-+        gpio_mask = snd_hda_codec_read(codec, codec->core.afg, 0,
-+                                       AC_VERB_GET_GPIO_MASK, 0);
-+        if (gpio_mask == 0) {
-+                codec_info(codec, "codec state lost over suspend, running the boot setup again\n");
-+                if (cs_8409_boot_setup(codec) < 0)
-+                        codec_err(codec, "boot setup after resume failed\n");
-+                spec->headset_phase = 2;
-+                spec->play_init = 0;
-+                spec->capture_init = 0;
-+                spec->play_init_count = 0;
-+                spec->capture_init_count = 0;
-+        }
-+
-         // code copied from default resume ops
-         snd_hda_codec_init(codec);       
- 	snd_hda_regmap_sync(codec);
-```
+there is no reason to prefer it.
 
 **Provoking the failure.** `hda-verb` (package `alsa-tools`) can put
-the codec into its power-on state on demand — an HDA function-group reset,
+the codec into its power-on state on demand, with an HDA function-group reset,
 twice, as the specification wants:
 
 ```bash
@@ -1125,9 +1196,8 @@ sudo hda-verb /dev/snd/hwC0D0 0x01 0x7ff 0
 ```
 
 With either patch the next resume, runtime or system, reprograms the codec, the
-dump is identical to the healthy one and the speakers play (the smaller patch
-logs `codec state lost over suspend, running the boot setup again`). Two things
-learned on the way there:
+dump is identical to the healthy one and the speakers play. Two things learned
+on the way there:
 
 - **Zeroing only the GPIO mask is not a valid test.** The boot setup is written
   for a codec fresh out of reset; run on one that was merely poked, it restored
@@ -1139,7 +1209,7 @@ learned on the way there:
   fails to probe the second time (`probe ... failed with error -22`, a WARNING
   in `hda_codec_driver_probe`), the generic driver takes the codec with no
   outputs, and only HDMI devices remain. `reconfig` in sysfs is refused with
-  `EBUSY`. Before the patch a reboot was the only way back.
+  `EBUSY`. A reboot is the only way back.
   [#215](https://github.com/davidjo/snd_hda_macbookpro/pull/215), from another
   MacBookPro13,1 owner, is about exactly this rebind failure.
 
@@ -2297,7 +2367,7 @@ Forked so the patches stay available regardless of upstream merge timing.
 |---|---|---|
 | [federal1970/facetimehd](https://github.com/federal1970/facetimehd) | [juicecultus/facetimehd](https://github.com/juicecultus/facetimehd) | FaceTime HD driver, **includes the kernel 7.2 `strscpy` fix and the buffer timestamp fix** |
 | [federal1970/facetimehd-firmware](https://github.com/federal1970/facetimehd-firmware) | [patjak/facetimehd-firmware](https://github.com/patjak/facetimehd-firmware) | Camera firmware extraction, used unmodified |
-| [federal1970/snd_hda_macbookpro](https://github.com/federal1970/snd_hda_macbookpro) | [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) | Cirrus CS8409 audio driver, with [upstream PR #220](#speakers-silent-after-sleep--the-driver-never-re-initialises-the-codec-2026-10-03) applied locally for resume |
+| [federal1970/snd_hda_macbookpro](https://github.com/federal1970/snd_hda_macbookpro) | [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) | Cirrus CS8409 replay driver, [used here until 2026-10-04](#before-2026-10-04-the-out-of-tree-replay-driver) |
 
 ---
 
@@ -2381,9 +2451,12 @@ Forked so the patches stay available regardless of upstream merge timing.
    same hardware, but not through newer firmware — its blob is a revision older
    than the one Linux loads. It does SAE in the host, and `brcmfmac` has no host
    SAE path for this chip. A driver patch, not a firmware swap.
-4. **Hibernation with the audio driver loaded** — its README warns the hardware stays
-   permanently powered on; the 4.1 W idle drain may partly come from there. Worth
-   measuring with the module unloaded.
+4. **Audio hardware permanently powered: gone with the old driver.** The replay
+   driver's README warned that the hardware stays powered all the time, and this
+   entry suspected it of a share in the 4.1 W `s2idle` drain. The
+   [driver in use now](#audio-cirrus-cs8409) runtime-suspends the codec and
+   switches the amplifiers off when nothing plays. The drain was not measured
+   again: `s2idle` is not used here.
 5. **Suspend with `facetimehd` loaded** — the AUR package warns the module breaks
    suspend. Not reproduced for `s2idle`: a 60-second cycle resumed cleanly with the
    module loaded and the camera still streamed afterwards. Long cycles remain
@@ -2572,7 +2645,8 @@ Forked so the patches stay available regardless of upstream merge timing.
 - [Dunedan/mbp-2016-linux#207](https://github.com/Dunedan/mbp-2016-linux/issues/207) —
   the working suspend configuration for MacBookPro13,1
 - [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) —
-  Cirrus CS8409 audio driver
+  the out-of-tree Cirrus CS8409 driver for Apple machines; the register values
+  of the board added here come from it
 - [patjak/facetimehd-firmware](https://github.com/patjak/facetimehd-firmware) —
   camera firmware extraction
 - [juicecultus/facetimehd](https://github.com/juicecultus/facetimehd) — FaceTime HD

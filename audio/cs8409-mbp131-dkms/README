@@ -1,0 +1,14 @@
+snd-hda-codec-cs8409 with Apple MacBookPro13,1 support, as a DKMS package.
+
+The driver is the in-tree sound/hda/codecs/cirrus/cs8409 of Linux 7.2 plus the
+three patches of the RFC series (../upstream/series-rfc-v1).
+hda/ mirrors sound/hda: the three driver files and the private headers they
+include. Those headers are the ones of Linux 7.2, so dkms.conf refuses to build
+for any other kernel series; for a new series the headers have to be refreshed
+from that kernel's source first.
+
+  sudo ./install.sh        take snd_hda_macbookpro out of DKMS, put this in
+  sudo reboot              the installed module takes over at the next boot
+
+PACKAGE_VERSION carries the date and the revision of the driver sources it was
+exported from.
