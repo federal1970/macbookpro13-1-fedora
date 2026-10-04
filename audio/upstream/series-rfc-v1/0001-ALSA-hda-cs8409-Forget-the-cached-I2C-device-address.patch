@@ -1,7 +1,7 @@
-From 20158014477c730e632e4ff472d216361a0da2a8 Mon Sep 17 00:00:00 2001
+From 73ef732e24e076314b08d44519c942a756c0b5a9 Mon Sep 17 00:00:00 2001
 From: Michal Szpakowski <michi.szpakowski@gmail.com>
-Date: Sun, 4 Oct 2026 15:51:35 +0200
-Subject: [RFC PATCH 1/2] ALSA: hda/cs8409: Forget the cached I2C device
+Date: Sun, 4 Oct 2026 19:11:28 +0200
+Subject: [RFC PATCH 1/3] ALSA: hda/cs8409: Forget the cached I2C device
  address on suspend
 
 cs8409_set_i2c_dev_addr() writes the I2C address register of the CS8409
@@ -11,41 +11,66 @@ nothing ever invalidates that cache.
 If the CS8409 loses its register contents while the codec is suspended,
 the address register is back at its reset value and the cache still
 holds the address of the device accessed last. With a single companion
-codec on the bus every access after resume then skips the write and
-goes out with the wrong address.
+codec on the bus every access after resume then skips the write, and the
+whole init sequence of the companion codec goes out with the wrong
+address.
 
-Seen on an Apple MacBookPro13,1, a CS8409 with a CS42L83 and four
-SSM3515 amplifiers, where the codec loses power in S3. The CS42L83 was
-the device accessed last before the suspend. At the init after resume
-its device ID read as zeroes; the amplifiers, addressed after it,
-answered, and so did the CS42L83 from then on, the address register
-having been written for the amplifiers in between.
+Seen on an Apple MacBookPro13,1, for which a later patch adds support:
+a CS8409 with a CS42L83 and four SSM3515 amplifiers, where the codec
+loses power in S3 and the CS42L83 was the device accessed last before
+the suspend. After resume the CS42L83 did not take its init; the
+amplifiers, addressed after it, did, and so did the CS42L83 from then
+on, the address register having been written for the amplifiers in
+between.
 
-Invalidate the cache in the suspend path.
+Invalidate the cache in the suspend path. The I2C part of the suspend
+moves into a helper of its own, cs8409_suspend_i2c(), which the
+MacBook's suspend function will share. The boards supported so far are
+not known to be affected, hence no Fixes tag.
 
 Assisted-by: Claude:claude-fable-5-1
 ---
- sound/hda/codecs/cirrus/cs8409.c | 7 +++++++
- 1 file changed, 7 insertions(+)
+ sound/hda/codecs/cirrus/cs8409.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
 
 diff --git a/sound/hda/codecs/cirrus/cs8409.c b/sound/hda/codecs/cirrus/cs8409.c
-index c43ff3ef7..ce02fcd9f 100644
+index c43ff3ef7..998e821f7 100644
 --- a/sound/hda/codecs/cirrus/cs8409.c
 +++ b/sound/hda/codecs/cirrus/cs8409.c
-@@ -1027,6 +1027,13 @@ static int cs8409_cs42l42_suspend(struct hda_codec *codec)
- 	cancel_delayed_work_sync(&spec->i2c_clk_work);
- 	cs8409_disable_i2c_clock(codec);
+@@ -1010,6 +1010,22 @@ static void cs8409_unsol_event(struct hda_codec *codec, unsigned int res)
+ 		cs8409_cs42l42_jack_unsol_event(codec, res);
+ }
  
++static void cs8409_suspend_i2c(struct hda_codec *codec)
++{
++	struct cs8409_spec *spec = codec->spec;
++
++	/* Cancel i2c clock disable timer, and disable clock if left enabled */
++	cancel_delayed_work_sync(&spec->i2c_clk_work);
++	cs8409_disable_i2c_clock(codec);
++
 +	/*
 +	 * The CS8409 may lose power while suspended, and its I2C address
 +	 * register with it. With one device on the bus the cached address
 +	 * would never be written again.
 +	 */
 +	spec->dev_addr = 0;
++}
 +
+ /* Manage PDREF, when transition to D3hot */
+ static int cs8409_cs42l42_suspend(struct hda_codec *codec)
+ {
+@@ -1023,9 +1039,7 @@ static int cs8409_cs42l42_suspend(struct hda_codec *codec)
+ 	for (i = 0; i < spec->num_scodecs; i++)
+ 		cs42l42_suspend(spec->scodecs[i]);
+ 
+-	/* Cancel i2c clock disable timer, and disable clock if left enabled */
+-	cancel_delayed_work_sync(&spec->i2c_clk_work);
+-	cs8409_disable_i2c_clock(codec);
++	cs8409_suspend_i2c(codec);
+ 
  	snd_hda_shutup_pins(codec);
  
- 	return 0;
 -- 
 2.55.0
 

@@ -121,14 +121,16 @@ Open:
 
 ## 2026-10-04: everything works; an RFC series
 
-State: [`series-rfc-v1/`](series-rfc-v1), two patches
-against `tiwai/sound.git` for-next (`12455e2b8`, whose three cs8409 files are
-those of 7.2). Patch 2 is the tree that was tested, byte for byte. Working
-tree `~/dev/cs8409-apple`: `master` is the clean code, the branch `diag` the
-same logic with the instruments below. checkpatch `--strict`: nothing on
-patch 1, four CamelCase checks on existing coefficient names on patch 2. The
-patches carry `Assisted-by` and no `Signed-off-by`: the kernel's
-`coding-assistants.rst` leaves that to the human who sends them.
+State (as of the evening, after the changes described at the end):
+[`series-rfc-v1/`](series-rfc-v1), three patches against `tiwai/sound.git`
+for-next (`12455e2b8`, whose three cs8409 files are those of 7.2). Patch 3 is
+the tree that was tested, byte for byte, and the same sources are installed
+here through DKMS. Working tree `~/dev/cs8409-apple`: `master` is the clean
+code, the branch `diag` an earlier state with the instruments below.
+checkpatch `--strict`: nothing on patches 1 and 2, four CamelCase checks on
+existing coefficient names on patch 3. The patches carry `Assisted-by` and no
+`Signed-off-by`: the kernel's `coding-assistants.rst` leaves that to the human
+who sends them.
 
 Every "open" point of the section above is closed, and the five failed attempts
 listed there proved nothing: they were all made in a state the first row of
@@ -142,7 +144,7 @@ this table explains.
 | speakers for a fraction of a second and crackles at every start from idle | each runtime resume reset the CS42L83 and ran the type detection under the starting stream | standby keeps the jack state; the resume only undoes the standby and compares the tip sense. Full init only for the first init, after S3 (GPIO mask gone) and after a system suspend (reset line low) |
 | headphones silent for a whole stream, about one S3 under music in three | `ASP_RX_DAI0_EN` was set before the switch from the oscillator to the bit clock; the receive side sometimes stayed deaf | enable the serial port channels after the clock switch, clear them at cleanup. 11 S3 cycles under music without a failure afterwards |
 | "Timeout waiting for PDN_DONE" at a system suspend under a stream | the PLL still running when `cs42l42_suspend()` powers the ADC and HP down, which `cs42l42.h` forbids | stop the PLL first |
-| an unplug in standby is noticed only at the next resume | the interrupt wakes the codec, but the debounced level in `0x1b77` reads "present" for about 0.47 s more | on the way out of standby the latched status (`0x1b7b`, an alias of `0x1309`) says what happened, and the level is polled until it follows |
+| an unplug in standby is noticed only at the next resume | an artefact of a mechanism that was not needed: the standby armed a second interrupt (page `0x1b`) and compared its debounced level, which lags the event by about 0.47 s | the mechanism is gone, see the last section: the ordinary tip sense wakes the codec by itself |
 
 Also new: `Speaker Playback Volume` on the SSM3515 digital volume, 0.375 dB a
 step, stopping at the −3 dB AppleHDA programs; the headset microphone works
@@ -174,3 +176,40 @@ between the good and the bad state:
   and the volume keys then move between two values only.
   `systemctl --user restart plasma-kded6.service` after a swap.
 
+## 2026-10-04, later: what changed before the series was final
+
+The code of the morning was read again against the kernel source, the ASoC
+cs42l42 driver and the decode, and every resulting version was run on the
+hardware. What that turned up, most important first:
+
+| what was wrong | what was done |
+|---|---|
+| `MCLK_SRC_SEL` is 0, so the CS42L83 PLL that was started, waited for and stopped is never selected | PLL setup, start, lock wait and stop removed; headphones unchanged. What had cured the distortion was the per-stream order, not the PLL |
+| the type detection took a headset for headphones: seated at an init 69 of 69 right, plug under a stream 4 of about 19 wrong. The Dell-derived table has no rise debounce on the tip sense, so the detection ran while the plug was sliding in | `TSENSE_CTL` := 0x85 (1 s, the ASoC default): 33 of 33 right since |
+| a plug in standby was typed without the settle time; after an init with a headset in, the detection ran twice | dynamic debug showed the ordinary tip/ring sense wakes the codec from standby by itself (5 of 5 unplugs, 5 of 5 plugs) and that its debounced "plugged" starts the detection a second after the plug. The page `0x1b` interrupt and the polling in the resume were removed; a board flag makes the shared code skip the detection for a jack already in |
+| the jack handler was not excluded from a runtime suspend; with the debounced "plugged" arriving 1.05 s after a plug and the autosuspend about 1.2 s after the wake, every plug in standby passed within 150 ms of it | the handler holds `pm_runtime_get_if_active()` for its run, and otherwise asks for a resume |
+| the light way out of standby was chosen from two GPIO readbacks, which s2idle or a hibernation restore could satisfy with the rest gone | light way only for a runtime resume (`power_state` ON) that also finds one coefficient of the table; full init after any system sleep |
+| the speaker PCM was advertised with four channels; PipeWire offered Surround 2.1 and 4.0 | `multiout.max_channels = 2`; only the stereo profile is offered |
+| nothing serialised the jack handler against the PCM hooks | a mutex around the handler, the hooks and the volume put; a system suspend takes it too |
+| `DEV_CFG3` was 0x0280 after a full init and 0x0080 after a light resume (the init verbs replayed on every init) | the verbs write 0x0280 |
+| the "jack already in" skip made the state a latch | board flag only; the detection result is checked against the tip sense after the unmask; out of standby, any status but "plugged" ends a jack believed in |
+| with `CONFIG_PM=n` the sync work never ran | a negative return of `pm_runtime_get_if_active()` means "no runtime PM, go on" |
+
+Structure: the board's suspend and its sync work hang on two hooks in the spec
+instead of board tests in common functions; `cs8409_suspend_i2c()` is the
+shared tail of both suspend functions; header constants and `read_poll_timeout`
+instead of literals and open loops. The series is three patches now: the cached
+I2C address, the flag for a debounced tip sense in the shared code, the board.
+
+The third row is the lesson of the first table again: the claim "the tip/ring
+sense does not work in standby" dated from the tests made with the interrupt
+line stuck, and a whole mechanism had been built on it.
+
+Run on the hardware on the final sources: headphones from idle, plug and
+unplug under a stream and in standby (each plug detected once, with the
+microphone), volume keys, S3 under music (one detection, no `PDN_DONE`
+timeout), both microphones. s2idle and hibernation are not tested.
+
+The driver is in use here through DKMS: `~/dev/cs8409-mbp131-dkms` holds the
+three files and the private HDA headers of Linux 7.2, which `kernel-devel`
+does not ship; `dkms.conf` therefore refuses any other kernel series.

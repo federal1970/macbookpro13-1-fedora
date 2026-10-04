@@ -1,7 +1,7 @@
-From a4dac745232cf30899fb4380a6b087a3d3c75460 Mon Sep 17 00:00:00 2001
+From 5302fd86538ab7ac0fb8521cb9df8e0b389b68d4 Mon Sep 17 00:00:00 2001
 From: Michal Szpakowski <michi.szpakowski@gmail.com>
-Date: Sun, 4 Oct 2026 15:52:02 +0200
-Subject: [RFC PATCH 2/2] ALSA: hda/cs8409: Add support for Apple
+Date: Sun, 4 Oct 2026 20:09:22 +0200
+Subject: [RFC PATCH 3/3] ALSA: hda/cs8409: Add support for Apple
  MacBookPro13,1
 
 The 2016 13" MacBook Pro without Touch Bar has a CS8409 with codec
@@ -19,73 +19,115 @@ The register values come from the out-of-tree snd_hda_macbookpro driver
 (https://github.com/davidjo/snd_hda_macbookpro), which replays the
 sequences of AppleHDA, read down to the register level and put into the
 structure of this driver: the vendor coefficient table, the CS42L83 init
-sequence with the clocking AppleHDA uses for 44.1 kHz, the SSM3515
-setup. Only 44.1 kHz is supported, as nothing else is known.
+sequence with the serial port and sample rate converter settings
+AppleHDA uses for 44.1 kHz, the SSM3515 setup. Only 44.1 kHz is
+supported, as nothing else is known. Not taken over, with nothing found
+to depend on them: the CS42L83 PLL, which AppleHDA programs and starts
+but, with MCLK_SRC_SEL left at 0, does not use; three CS42L83 registers
+outside cs42l42.h (0x107e, 0x1b08, 0x2102); the vendor verb 0x7f0 and
+the writes to coefficients 0x6b, 0x6c and 0x71. The amplifier slot map
+is the out-of-tree driver's, not the one in AppleHDA's log; left and
+right were checked by ear, which amplifier drives which driver of a
+side is not known.
 
 What differs from the Dell boards:
 
-- The fixup is also picked by DMI. The firmware writes the codec
-  subsystem ID at boot and a link reset puts the CS8409's own ID back,
-  so the ID is not there after the module has been reloaded.
+- The fixup is also picked by DMI. The codec subsystem ID the firmware
+  writes at boot is no longer there after the controller has been probed
+  again, for instance after a module reload; the CS8409 then reports its
+  own ID. The quirk matches the subsystem ID, which other models may
+  share (the out-of-tree driver uses it for the MacBookPro14,1 too; not
+  tested); the DMI entry names the 13,1 only.
 
-- The CS42L83 serial port carries 44.1 kHz in a 48 kHz frame through
-  the sample rate converters, on a PLL fed from the bit clock. Started
-  once from the init, as the Dell setup does, the headphone path came up
-  right for one stream and distorted or silent for the next. So the
-  blocks are powered, the PLL started and the serial port channels
-  enabled when a stream is prepared, in that order, and taken down when
-  the last stream is cleaned up, as the ASoC cs42l42 driver and AppleHDA
-  do. The PLL is also stopped before a system suspend powers the CS42L83
-  down under a running stream, which removes a "Timeout waiting for
-  PDN_DONE".
+- The CS42L83 is brought up around each stream instead of once at init:
+  when a stream is prepared, the blocks of its direction are powered,
+  the chip is switched from its oscillator to the bit clock of ASP2, and
+  only then are the serial port channels enabled; the last cleanup takes
+  it back. The ASoC cs42l42 driver and AppleHDA work per stream as well.
+  Like AppleHDA, and unlike the ASoC driver, this enables the channels
+  after the clock switch: enabled before it, the receive side now and
+  then stayed deaf for a whole stream. Unlike AppleHDA, which powers the
+  blocks after enabling the channels and the headphone amplifier last,
+  the blocks are powered first, all at once. Put on the bit clock once
+  from the init with everything up, the Dell way, the headphone path
+  came up right for one stream and distorted or silent for the next.
+  Every stream goes through this, also one that only uses the speakers
+  or the internal microphone. Before a system suspend powers the chip
+  down under a running stream, where no cleanup has run, it is taken
+  back to its oscillator too.
 
-- Runtime suspend keeps the CS42L83 out of reset, powered down except
-  for the detect block and on its oscillator, with the tip sense
-  interrupt armed for the opposite of the present jack state and the
-  GPIO unsolicited response left enabled. A plug or unplug then wakes
-  the codec, and a headset that stays plugged is not detected again on
-  every resume: that detection ran under each stream started from idle,
-  with the speakers on until it was done. On the way out of standby the
-  latched detect status says what woke the codec and the tip sense level
-  is given time to follow it: after an unplug the debounced level reads
-  "present" for about half a second more. The full init remains for the
-  first init, after S3, where the CS8409 loses its registers, and after
-  a system suspend.
+- Runtime suspend does not reset the CS42L83. It stays out of reset,
+  powered down and on its oscillator, with its tip sense interrupt and
+  the GPIO unsolicited response left enabled, so a plug or unplug wakes
+  the codec; the resume reads the tip sense status and acts on a change.
+  A headset that stays plugged is thus not detected again on every
+  resume: that detection ran under each stream started from idle, with
+  the speakers on until it was done. This light way out is taken only
+  for a runtime resume that finds the CS8409 as it was left; every
+  system sleep is followed by the full init, which, as on the Dell
+  boards, starts from "no jack": a headset left in is reported out and
+  then in again. (The core leaves power_state at RESUME after a system
+  suspend aborted before the codec's callback ran; until the next resume
+  the board then behaves as after a system sleep.) A shutdown runs as a
+  runtime suspend and leaves the chip in standby. The jack handler holds
+  a runtime PM reference while it runs, so that it cannot work into a
+  runtime suspend; an interrupt that finds the codec not active asks for
+  a resume instead. A system suspend takes the jack lock.
+
+- The common suspend function gets a per-board hook, spec->suspend, and
+  the sync work below another, spec->irq_sync.
 
 - An interrupt raised before the card is registered is recovered. The
   HDA core drops unsolicited responses until then, the jack detection
   run from the build action raises its interrupt before, nobody reads
   the CS42L83 status and the line stays low: no later event makes an
   edge. A delayed work looks at the line once responses get through.
+  The Dell boards run the same detection at the same point; whether to
+  solve this for all boards is a question for the list.
 
-- The speakers get a "Speaker Playback Volume" on the digital volume of
-  the amplifiers. It stops at the -3 dB AppleHDA programs, since nothing
-  here knows what the drivers stand above it.
+- The tip sense gets a 1 s rise debounce (the Dell tables have none, the
+  ASoC driver defaults to 1 s) and sets the flag of the previous patch.
+  Without the debounce the type detection ran while the plug was still
+  sliding in and took a headset for headphones on 4 of about 19 plugs
+  under a running stream; with it, on none of 33, with a stream running
+  or with the codec runtime suspended.
+
+- The speakers are one stereo pair on two converters: the PCM is limited
+  to two channels and the second converter gets a copy of the first.
+  They get a "Speaker Playback Volume" on the digital volume of the
+  amplifiers. It stops at the -3 dB AppleHDA programs: there is no
+  speaker protection here, and nothing in this driver knows what the
+  drivers stand above that level.
+
+- The jack handler, the PCM hooks and the speaker volume are serialised
+  by a mutex of their own. The runtime PM callbacks do not need it: the
+  handler is kept off them by its runtime PM reference.
 
 Tested on a MacBookPro13,1 with this driver built as a module against
 Fedora's 7.2.8: speakers, speaker volume, headphones and headset
 microphone (Koss Porta Pro with microphone), internal microphone, plug
 and unplug with a stream running and with the codec runtime suspended,
-playback started from idle, S3 from idle and under a running stream.
+playback started from idle, S3 (deep) from idle and under a running
+stream.
 
-Not handled: headset buttons; sample rates other than 44.1 kHz. The
-headset type detection, which is the cs42l42 code of this driver, took
-the headset for headphones three times in about 30 plugs.
+Not tested: s2idle and hibernation. Not handled: headset buttons;
+sample rates other than 44.1 kHz. The CS8409's PLLs and serial ports
+stay enabled while the codec is in D3.
 
 Assisted-by: Claude:claude-fable-5-1
 ---
- sound/hda/codecs/cirrus/cs8409-tables.c | 215 ++++++++
- sound/hda/codecs/cirrus/cs8409.c        | 666 +++++++++++++++++++++++-
- sound/hda/codecs/cirrus/cs8409.h        |  46 ++
- 3 files changed, 925 insertions(+), 2 deletions(-)
+ sound/hda/codecs/cirrus/cs8409-tables.c | 209 +++++++
+ sound/hda/codecs/cirrus/cs8409.c        | 774 ++++++++++++++++++++++++
+ sound/hda/codecs/cirrus/cs8409.h        |  50 ++
+ 3 files changed, 1033 insertions(+)
 
 diff --git a/sound/hda/codecs/cirrus/cs8409-tables.c b/sound/hda/codecs/cirrus/cs8409-tables.c
-index b9ec8fb8e..824678b4d 100644
+index b9ec8fb8e..ee437dbcb 100644
 --- a/sound/hda/codecs/cirrus/cs8409-tables.c
 +++ b/sound/hda/codecs/cirrus/cs8409-tables.c
-@@ -537,6 +537,209 @@ const struct cs8409_cir_param cs8409_cdb35l56_four_hw_cfg[] = {
-  *                    Arrays Used for all projects using CS8409
-  ******************************************************************************/
+@@ -532,6 +532,203 @@ const struct cs8409_cir_param cs8409_cdb35l56_four_hw_cfg[] = {
+ 	{} /* Terminator */
+ };
  
 +/******************************************************************************
 + *                      Apple MacBookPro13,1 Specific Arrays
@@ -108,15 +150,16 @@ index b9ec8fb8e..824678b4d 100644
 +	{ CS8409_PIN_AFG, AC_VERB_SET_GPIO_WAKE_MASK, 0x0001 },		/* WAKE from GPIO 0 */
 +	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_PROC_STATE, 0x0001 },	/* Enable VPW processing */
 +	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_COEF_INDEX, 0x0002 },	/* Configure GPIO 6,7 */
-+	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_PROC_COEF,  0x0080 },	/* I2C mode */
++	/* I2C mode, and the bus idle setting mbp131_hw_cfg ends with */
++	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_PROC_COEF,  0x0280 },
 +	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_COEF_INDEX, 0x005b },	/* I2C control */
 +	{ CS8409_PIN_VENDOR_WIDGET, AC_VERB_SET_PROC_COEF,  0x0010 },	/* as AppleHDA sets it */
 +	{} /* terminator */
 +};
 +
 +/*
-+ * The firmware programs these at boot, but they are gone, together with the
-+ * subsystem ID, once the controller has reset the link.
++ * The firmware programs these at boot, but they are not there any more,
++ * together with the subsystem ID, once the controller has been probed again.
 + */
 +static const struct hda_pintbl mbp131_pincfgs[] = {
 +	{ CS8409_PIN_ASP1_TRANSMITTER_A, 0x90100110 },	/* ASP-1-TX A, speakers */
@@ -187,7 +230,7 @@ index b9ec8fb8e..824678b4d 100644
 +/* Written to each of the four amps after its TDM slot, before it is powered up */
 +const struct cs8409_i2c_param mbp131_ssm3515_init_reg_seq[] = {
 +	{ SSM3515_GEC, 0x11 },		/* low EMI edge rate, 12.6 V full scale */
-+	{ SSM3515_DAC_VOL, 0x48 },	/* -3 dB */
++	{ SSM3515_DAC_VOL, MBP131_SPK_VOL_REG_MAX },	/* -3 dB */
 +	{ SSM3515_SAI1, 0x51 },		/* TDM, 32 bit clocks per slot */
 +	{ SSM3515_DAC, 0x32 },		/* 32 to 48 kHz, high-pass on, unmuted */
 +};
@@ -195,11 +238,11 @@ index b9ec8fb8e..824678b4d 100644
 +const unsigned int mbp131_ssm3515_init_reg_seq_num = ARRAY_SIZE(mbp131_ssm3515_init_reg_seq);
 +
 +/*
-+ * The CS42L42 sequence with the clocking AppleHDA uses for 44.1 kHz: the
-+ * serial port runs through the sample rate converters and the PLL runs from
-+ * the 11.2896 MHz bit clock. The PLL is not started here, the blocks stay
-+ * powered down and the serial port channels disabled: that is done around each
-+ * stream, see mbp131_cs42l83_stream().
++ * The CS42L42 sequence with the serial port and sample rate converter settings
++ * AppleHDA uses for 44.1 kHz. The master clock is the bit clock of ASP2 itself
++ * (MCLK_SRC_SEL 0), so the PLL AppleHDA also programs is not used. The chip is
++ * left on its oscillator, the blocks powered down and the serial port channels
++ * disabled: that is done around each stream, see mbp131_cs42l83_stream().
 + */
 +static const struct cs8409_i2c_param mbp131_cs42l83_init_reg_seq[] = {
 +	{ CS42L42_I2C_TIMEOUT, 0xB0 },
@@ -208,15 +251,6 @@ index b9ec8fb8e..824678b4d 100644
 +	{ CS42L42_ADC_VOLUME, 0x9F },
 +	{ CS42L42_SRC_CTL, 0x10 },
 +	{ CS42L42_MCLK_CTL, 0x02 },
-+	{ CS42L42_PLL_DIV_CFG1, 0x02 },
-+	{ CS42L42_PLL_DIV_FRAC0, 0xFF },
-+	{ CS42L42_PLL_DIV_FRAC1, 0x9C },
-+	{ CS42L42_PLL_DIV_FRAC2, 0x70 },
-+	{ CS42L42_PLL_DIV_INT, 0x2E },
-+	{ CS42L42_PLL_CTL4, 0x03 },
-+	{ CS42L42_PLL_CAL_RATIO, 0x5D },
-+	{ CS42L42_PLL_CTL3, 0x10 },
-+	{ CS42L42_PLL_CTL1, 0x00 },
 +	{ CS42L42_FSYNC_P_LOWER, 0xFF },
 +	{ CS42L42_FSYNC_P_UPPER, 0x00 },
 +	{ CS42L42_MCLK_SRC_SEL, 0x00 },
@@ -260,7 +294,8 @@ index b9ec8fb8e..824678b4d 100644
 +	{ CS42L42_PWR_CTL3, 0x20 },
 +	{ CS42L42_RSENSE_CTL2, 0x00 },
 +	{ CS42L42_RSENSE_CTL3, 0x00 },
-+	{ CS42L42_TSENSE_CTL, 0x80 },
++	/* tip sense inverted, 1 s rise debounce: detect the type of a seated plug */
++	{ CS42L42_TSENSE_CTL, 0x85 },
 +	{ CS42L42_HS_BIAS_CTL, 0xC0 },
 +	{ CS42L42_PWR_CTL1, 0xFE, 10000 },
 +	{ CS42L42_ADC_OVFL_INT_MASK, 0xff },
@@ -288,12 +323,13 @@ index b9ec8fb8e..824678b4d 100644
 +	.paged = 1,
 +	.suspended = 1,
 +	.no_type_dect = 0,
++	.ts_rise_dbnc = 1,
 +};
 +
- const struct hda_quirk cs8409_fixup_tbl[] = {
- 	SND_PCI_QUIRK(0x1028, 0x0A11, "Bullseye", CS8409_BULLSEYE),
- 	SND_PCI_QUIRK(0x1028, 0x0A12, "Bullseye", CS8409_BULLSEYE),
-@@ -618,6 +821,7 @@ const struct hda_quirk cs8409_fixup_tbl[] = {
+ /******************************************************************************
+  *                         CS8409 Patch Driver Structs
+  *                    Arrays Used for all projects using CS8409
+@@ -618,6 +815,7 @@ const struct hda_quirk cs8409_fixup_tbl[] = {
  	SND_PCI_QUIRK(0x1028, 0x0C75, "Dolphin", CS8409_DOLPHIN),
  	SND_PCI_QUIRK(0x1028, 0x0C7D, "Dolphin", CS8409_DOLPHIN),
  	SND_PCI_QUIRK(0x1028, 0x0C7F, "Dolphin", CS8409_DOLPHIN),
@@ -301,7 +337,7 @@ index b9ec8fb8e..824678b4d 100644
  	{} /* terminator */
  };
  
-@@ -630,6 +834,7 @@ const struct hda_model_fixup cs8409_models[] = {
+@@ -630,6 +828,7 @@ const struct hda_model_fixup cs8409_models[] = {
  	{ .id = CS8409_DOLPHIN, .name = "dolphin" },
  	{ .id = CS8409_ODIN, .name = "odin" },
  	{ .id = CS8409_CDB35L56_FOUR_HD, .name = "CDB35L56-FOUR-HD" },
@@ -309,7 +345,7 @@ index b9ec8fb8e..824678b4d 100644
  	{}
  };
  
-@@ -694,4 +899,14 @@ const struct hda_fixup cs8409_fixups[] = {
+@@ -694,4 +893,14 @@ const struct hda_fixup cs8409_fixups[] = {
  		.type = HDA_FIXUP_FUNC,
  		.v.func = cs8409_cdb35l56_four_autodet_fixup,
  	},
@@ -325,7 +361,7 @@ index b9ec8fb8e..824678b4d 100644
 +	},
  };
 diff --git a/sound/hda/codecs/cirrus/cs8409.c b/sound/hda/codecs/cirrus/cs8409.c
-index ce02fcd9f..9e3757e00 100644
+index 2461e0a68..a3f886183 100644
 --- a/sound/hda/codecs/cirrus/cs8409.c
 +++ b/sound/hda/codecs/cirrus/cs8409.c
 @@ -7,6 +7,7 @@
@@ -344,113 +380,52 @@ index ce02fcd9f..9e3757e00 100644
  #include <linux/iopoll.h>
  
  #include "cs8409.h"
-@@ -947,10 +949,69 @@ static void cs42l42_suspend(struct sub_codec *cs42l42)
- 	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, spec->gpio_data);
- }
+@@ -57,6 +59,14 @@ static int cs8409_parse_auto_config(struct hda_codec *codec)
  
-+/*
-+ * MacBookPro13,1: the CS42L83 is on its PLL and the bit clock only while a
-+ * stream is up, see mbp131_cs42l83_stream().
-+ */
-+static void mbp131_cs42l83_clk_stop(struct sub_codec *cs42l83)
+ static void cs8409_disable_i2c_clock_worker(struct work_struct *work);
+ 
++static void cs8409_irq_sync_worker(struct work_struct *work)
 +{
-+	struct cs8409_spec *spec = cs42l83->codec->spec;
++	struct cs8409_spec *spec = container_of(work, struct cs8409_spec, irq_sync_work.work);
 +
-+	if (!spec->scodec_clk_on)
-+		return;
-+
-+	/* the bit clock has to be there still for this switch */
-+	cs8409_i2c_write(cs42l83, CS42L42_OSC_SWITCH, 0x00);
-+	usleep_range(150, 300);
-+	cs8409_i2c_write(cs42l83, CS42L42_PLL_CTL1, 0x00);
-+	spec->scodec_clk_on = 0;
++	if (spec->irq_sync)
++		spec->irq_sync(spec->codec);
 +}
 +
-+/*
-+ * Runtime suspend for a board that has nothing but the CS42L42's tip sense to
-+ * notice a plug: leave it out of reset, silent and powered down except for the
-+ * detection logic, on its own oscillator because the bit clock stops. Its
-+ * interrupt comes through as an unsolicited response of the CS8409, the handler
-+ * asks for a resume, and the resume looks at the tip sense.
-+ */
-+static void cs42l42_standby(struct sub_codec *cs42l42)
-+{
-+	static const struct cs8409_i2c_param cs42l42_standby_seq[] = {
-+		{ CS42L42_MIXER_CHA_VOL, 0x3F },
-+		{ CS42L42_MIXER_ADC_VOL, 0x3F },
-+		{ CS42L42_MIXER_CHB_VOL, 0x3F },
-+		{ CS42L42_HP_CTL, 0x0D },
-+		{ CS42L42_ASP_RX_DAI0_EN, 0x00 },
-+		{ CS42L42_OSC_SWITCH, 0x00 },
-+		{ CS42L42_PWR_CTL1, 0xFE },
-+	};
-+	bool tip;
-+
-+	cs8409_i2c_bulk_write(cs42l42, cs42l42_standby_seq, ARRAY_SIZE(cs42l42_standby_seq));
-+
-+	/*
-+	 * The tip/ring sense interrupt used while running needs the clocked
-+	 * part of the codec. The detect block on page 0x1b keeps working on its
-+	 * own, so arm its tip sense interrupt for the opposite of the present
-+	 * level. The status is cleared by reading.
-+	 */
-+	cs8409_i2c_read(cs42l42, CS42L83_DET_INT_STATUS1);
-+	tip = cs8409_i2c_read(cs42l42, CS42L42_DET_STATUS1) & CS42L42_TIP_SENSE_MASK;
-+	cs8409_i2c_write(cs42l42, CS42L42_DET_INT1_MASK, CS42L42_HSBIAS_SENSE_MASK |
-+			 (tip ? CS42L42_TIP_SENSE_PLUG_MASK : CS42L42_TIP_SENSE_UNPLUG_MASK));
-+
-+	/* the jack state stays: the chip is alive and reports any change */
-+	cs42l42->suspended = 1;
-+	cs42l42->last_page = 0;
-+}
-+
- static void cs8409_remove(struct hda_codec *codec)
+ static struct cs8409_spec *cs8409_alloc_spec(struct hda_codec *codec)
+ {
+ 	struct cs8409_spec *spec;
+@@ -68,7 +78,9 @@ static struct cs8409_spec *cs8409_alloc_spec(struct hda_codec *codec)
+ 	spec->codec = codec;
+ 	codec->power_save_node = 1;
+ 	mutex_init(&spec->i2c_mux);
++	mutex_init(&spec->jack_lock);
+ 	INIT_DELAYED_WORK(&spec->i2c_clk_work, cs8409_disable_i2c_clock_worker);
++	INIT_DELAYED_WORK(&spec->irq_sync_work, cs8409_irq_sync_worker);
+ 	snd_hda_gen_spec_init(&spec->gen);
+ 
+ 	return spec;
+@@ -972,6 +984,9 @@ static void cs8409_remove(struct hda_codec *codec)
  {
  	struct cs8409_spec *spec = codec->spec;
  
-+	if (codec->fixup_id == CS8409_MBP131)
-+		cancel_delayed_work_sync(&spec->irq_sync_work);
++	/* disabled, not only cancelled: an init on the way out must not arm it */
++	disable_delayed_work_sync(&spec->irq_sync_work);
 +
  	/* Cancel i2c clock disable timer, and disable clock if left enabled */
  	cancel_delayed_work_sync(&spec->i2c_clk_work);
  	cs8409_disable_i2c_clock(codec);
-@@ -1015,13 +1076,33 @@ static int cs8409_cs42l42_suspend(struct hda_codec *codec)
- {
+@@ -1053,6 +1068,9 @@ static int cs8409_cs42l42_suspend(struct hda_codec *codec)
  	struct cs8409_spec *spec = codec->spec;
  	int i;
-+	/* power_state is only something else than ON for a system sleep */
-+	bool standby = codec->fixup_id == CS8409_MBP131 &&
-+		       codec->core.dev.power.power_state.event == PM_EVENT_ON;
  
++	if (spec->suspend)
++		return spec->suspend(codec);
++
  	spec->init_done = 0;
  
--	cs8409_enable_ur(codec, 0);
-+	if (codec->fixup_id == CS8409_MBP131)
-+		cancel_delayed_work_sync(&spec->irq_sync_work);
- 
--	for (i = 0; i < spec->num_scodecs; i++)
-+	/* in standby the interrupt of the companion codec is what wakes us */
-+	if (!standby)
-+		cs8409_enable_ur(codec, 0);
-+
-+	for (i = 0; i < spec->num_scodecs; i++) {
-+		if (standby) {
-+			cs42l42_standby(spec->scodecs[i]);
-+			continue;
-+		}
-+		/*
-+		 * A system suspend under a running stream finds the PLL going.
-+		 * It must not run with the ADC and the HP powered down, which
-+		 * is what the power down sequence does first.
-+		 */
-+		if (codec->fixup_id == CS8409_MBP131)
-+			mbp131_cs42l83_clk_stop(spec->scodecs[i]);
- 		cs42l42_suspend(spec->scodecs[i]);
-+	}
- 
- 	/* Cancel i2c clock disable timer, and disable clock if left enabled */
- 	cancel_delayed_work_sync(&spec->i2c_clk_work);
-@@ -1591,6 +1672,586 @@ void dolphin_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int ac
+ 	cs8409_enable_ur(codec, 0);
+@@ -1619,6 +1637,761 @@ void dolphin_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int ac
  	}
  }
  
@@ -467,13 +442,15 @@ index ce02fcd9f..9e3757e00 100644
 +static struct sub_codec mbp131_ssm3515[MBP131_NUM_AMPS];
 +
 +/*
-+ * TDM slot of each amp. The two converters carry the same stereo pair when the
-+ * stream is stereo, so the frame is L R L R, and the amps at 0x14 and 0x15 are
-+ * the left ones.
++ * TDM slot of each amp. The two converters carry the same stereo pair, so the
++ * frame is L R L R; with this mapping, the one of the out-of-tree driver and
++ * not AppleHDA's 0 1 2 3, the amps at 0x14 and 0x15 get the left channel and
++ * left and right come out on their sides. Which amp drives which driver of a
++ * side is not known.
 + */
 +static const unsigned int mbp131_ssm3515_slot[MBP131_NUM_AMPS] = { 0, 2, 1, 3 };
 +
-+static void mbp131_amps_power(struct hda_codec *codec, bool on)
++static void mbp131_amps_power(bool on)
 +{
 +	int i;
 +
@@ -482,7 +459,16 @@ index ce02fcd9f..9e3757e00 100644
 +				 on ? 0 : SSM3515_PWR_SPWDN);
 +}
 +
-+static void mbp131_amps_init(struct hda_codec *codec)
++/* Keep the I2C helpers off the amps while the codec is suspended */
++static void mbp131_amps_suspended(bool suspended)
++{
++	int i;
++
++	for (i = 0; i < MBP131_NUM_AMPS; i++)
++		mbp131_ssm3515[i].suspended = suspended;
++}
++
++static void mbp131_amps_init(void)
 +{
 +	struct sub_codec *amp;
 +	int i;
@@ -548,9 +534,13 @@ index ce02fcd9f..9e3757e00 100644
 +	long *valp = uctrl->value.integer.value;
 +	int i, changed = 0;
 +
-+	for (i = 0; i < 2; i++) {
++	for (i = 0; i < 2; i++)
 +		if (valp[i] < 0 || valp[i] > MBP131_SPK_VOL_MAX)
 +			return -EINVAL;
++
++	guard(mutex)(&spec->jack_lock);
++
++	for (i = 0; i < 2; i++) {
 +		if (spec->speaker_vol[i] != valp[i]) {
 +			spec->speaker_vol[i] = valp[i];
 +			changed = 1;
@@ -581,83 +571,90 @@ index ce02fcd9f..9e3757e00 100644
 +
 +	snd_hda_set_pin_ctl(codec, MBP131_SPK_A_PIN_NID, on ? PIN_OUT : 0);
 +	snd_hda_set_pin_ctl(codec, MBP131_SPK_B_PIN_NID, on ? PIN_OUT : 0);
-+	mbp131_amps_power(codec, on && spec->playback_started);
++	mbp131_amps_power(on && spec->playback_started);
++}
++
++/* The CS42L83 back on its oscillator; the bit clock has to be there still */
++static void mbp131_cs42l83_clk_stop(struct sub_codec *cs42l83)
++{
++	struct cs8409_spec *spec = cs42l83->codec->spec;
++
++	if (!spec->scodec_clk_on)
++		return;
++
++	cs8409_i2c_write(cs42l83, CS42L42_OSC_SWITCH, 0);
++	usleep_range(CS42L42_CLOCK_SWITCH_DELAY_US, CS42L42_CLOCK_SWITCH_DELAY_US * 2);
++	spec->scodec_clk_on = 0;
 +}
 +
 +/*
-+ * The CS42L83 around a stream. Its serial port carries 44.1 kHz in a 48 kHz
-+ * frame through the sample rate converters, on a PLL fed from the bit clock.
-+ * Left running from the init, the converters came up right for one stream and
-+ * wrong for the next. So as the ASoC cs42l42 driver and AppleHDA do: blocks
-+ * powered and PLL started when a stream is prepared, back on the internal
-+ * oscillator with the PLL stopped when the last one is cleaned up.
++ * The CS42L83 around a stream. On its oscillator and powered down while idle,
++ * it gets the blocks of the stream's direction powered and is switched to the
++ * bit clock of ASP2 when a stream is prepared, and goes back when the last one
++ * is cleaned up; the ASoC cs42l42 driver and AppleHDA work per stream as well.
++ * Put on the bit clock once from the init with everything up, the way of the
++ * Dell boards, the headphone path came up right for one stream and distorted
++ * or silent for the next.
 + */
 +static void mbp131_cs42l83_stream(struct hda_codec *codec, unsigned int pdn_bits, bool on)
 +{
 +	struct cs8409_spec *spec = codec->spec;
 +	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
-+	int pwr, val = 0, n;
++	bool playback = pdn_bits & CS42L42_HP_PDN_MASK;
++	int pwr, val;
 +
 +	pwr = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
 +	if (pwr < 0)
 +		return;
 +
 +	if (!on) {
-+		if (pdn_bits & CS42L42_HP_PDN_MASK) {
++		if (playback) {
 +			cs8409_i2c_write(cs42l83, CS42L42_ASP_RX_DAI0_EN, 0x00);
 +		} else {
 +			cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_SZ_EN, 0x00);
 +			cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH_EN, 0x00);
 +		}
-+		/* PLL off first: it must not run with the ADC and the HP down */
 +		if (!spec->playback_started && !spec->capture_started)
 +			mbp131_cs42l83_clk_stop(cs42l83);
 +		cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, pwr | pdn_bits);
 +		return;
 +	}
 +
-+	/* the PLL must not be started with both the ADC and the HP down */
++	/*
++	 * All blocks of the direction at once, the headphone amplifier too:
++	 * AppleHDA powers that one last, after the converter has locked. No
++	 * pop was heard this way, and the mixer is still muted here.
++	 */
 +	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, pwr & ~pdn_bits);
 +
 +	if (!spec->scodec_clk_on) {
-+		cs8409_i2c_read(cs42l83, CS42L42_PLL_LOCK_STATUS);
-+		cs8409_i2c_write(cs42l83, CS42L42_PLL_CTL1, 0x01);
-+		for (n = 0; n < 50; n++) {
-+			usleep_range(1000, 1500);
-+			val = cs8409_i2c_read(cs42l83, CS42L42_PLL_LOCK_STATUS);
-+			if (val > 0 && (val & 1))
-+				break;
-+		}
-+		if (n == 50)
-+			codec_warn(codec, "CS42L83 PLL did not lock (%02x)\n", val);
-+		cs8409_i2c_write(cs42l83, CS42L42_OSC_SWITCH, 0x01);
-+		usleep_range(150, 300);
++		cs8409_i2c_write(cs42l83, CS42L42_OSC_SWITCH, CS42L42_SCLK_PRESENT_MASK);
++		usleep_range(CS42L42_CLOCK_SWITCH_DELAY_US, CS42L42_CLOCK_SWITCH_DELAY_US * 2);
 +		spec->scodec_clk_on = 1;
 +	}
 +
 +	/*
-+	 * The serial port channels only now, on the bit clock. Enabled ahead
-+	 * of the switch from the oscillator, the receive side now and then
-+	 * stayed deaf for the whole stream: everything locked, the headphone
-+	 * amp alive, no audio, until the enable was taken away and set again.
++	 * The serial port channels only now, on the bit clock. This order is
++	 * a finding on this board, not the ASoC driver's: enabled ahead of the
++	 * switch from the oscillator, the receive side now and then stayed
++	 * deaf for the whole stream, everything locked and the headphone amp
++	 * alive, until the enable was taken away and set again.
 +	 */
-+	if (!(pdn_bits & CS42L42_HP_PDN_MASK)) {
++	if (!playback) {
++		/* both channels, then the port */
 +		cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH_EN, 0x03);
 +		cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_SZ_EN, 0x01);
 +		return;
 +	}
 +
++	/* both channels of DAI0 */
 +	cs8409_i2c_write(cs42l83, CS42L42_ASP_RX_DAI0_EN, 0x0C);
 +
-+	/* the headphone path is unmuted once its converter has locked */
-+	for (n = 0; n < 50; n++) {
-+		val = cs8409_i2c_read(cs42l83, CS42L42_SRCPL_INT_STATUS);
-+		if (val > 0 && (val & CS42L42_SRCPL_DAC_LK_MASK))
-+			break;
-+		usleep_range(2000, 2500);
-+	}
-+	if (n == 50)
-+		codec_warn(codec, "CS42L83 DAC SRC did not lock (%02x)\n", val);
++	/* the hook unmutes the mixer once the converter has locked */
++	if (read_poll_timeout(cs8409_i2c_read, val,
++			      val < 0 || (val & CS42L42_SRCPL_DAC_LK_MASK),
++			      2000, 100000, false, cs42l83, CS42L42_SRCPL_INT_STATUS) < 0)
++		codec_warn(codec, "CS42L83 DAC SRC did not lock\n");
 +}
 +
 +#define MBP131_L83_PLAYBACK_PDN	(CS42L42_ASP_DAI_PDN_MASK | CS42L42_MIXER_PDN_MASK | \
@@ -667,6 +664,10 @@ index ce02fcd9f..9e3757e00 100644
 +static void mbp131_playback_pcm_hook(struct hda_pcm_stream *hinfo, struct hda_codec *codec,
 +				     struct snd_pcm_substream *substream, int action)
 +{
++	struct cs8409_spec *spec = codec->spec;
++
++	guard(mutex)(&spec->jack_lock);
++
 +	switch (action) {
 +	case HDA_GEN_PCM_ACT_PREPARE:
 +		mbp131_cs42l83_stream(codec, MBP131_L83_PLAYBACK_PDN, true);
@@ -688,6 +689,10 @@ index ce02fcd9f..9e3757e00 100644
 +static void mbp131_capture_pcm_hook(struct hda_pcm_stream *hinfo, struct hda_codec *codec,
 +				    struct snd_pcm_substream *substream, int action)
 +{
++	struct cs8409_spec *spec = codec->spec;
++
++	guard(mutex)(&spec->jack_lock);
++
 +	switch (action) {
 +	case HDA_GEN_PCM_ACT_PREPARE:
 +		mbp131_cs42l83_stream(codec, MBP131_L83_CAPTURE_PDN, true);
@@ -725,23 +730,47 @@ index ce02fcd9f..9e3757e00 100644
 + * As on the Dell boards the pins of the companion codec raise nothing
 + * themselves: the CS42L83 pulls GPIO 0 low, and its status registers say why.
 + */
-+static void mbp131_jack_unsol_event(struct hda_codec *codec, unsigned int res)
++static void mbp131_jack_event(struct hda_codec *codec, unsigned int gpio)
 +{
 +	struct cs8409_spec *spec = codec->spec;
 +	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
 +
++	lockdep_assert_held(&spec->jack_lock);
++
 +	/* the line going back up after the status registers were read */
-+	if (res & cs42l83->irq_mask)
++	if ((gpio & cs42l83->irq_mask) || cs42l83->suspended)
 +		return;
 +
-+	/* in standby: the init on resume finds out what happened */
-+	if (cs42l83->suspended) {
-+		pm_request_resume(hda_codec_dev(codec));
++	if (cs42l42_jack_unsol_event(cs42l83) > 0)
++		mbp131_jack_report(codec);
++}
++
++static void mbp131_jack_unsol_event(struct hda_codec *codec, unsigned int res)
++{
++	struct cs8409_spec *spec = codec->spec;
++	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
++	struct device *dev = hda_codec_dev(codec);
++	int active;
++
++	/*
++	 * Not while the codec is on its way down or up: the handler would run
++	 * its I2C sequences into those of the standby. A reference keeps a
++	 * runtime suspend away for as long as the handler takes. Without one,
++	 * ask for a resume: it looks at the tip sense status itself, and the
++	 * sync work after it at the line. Negative means no runtime PM.
++	 */
++	active = pm_runtime_get_if_active(dev);
++	if (!active) {
++		if (!(res & cs42l83->irq_mask))
++			pm_request_resume(dev);
 +		return;
 +	}
 +
-+	if (cs42l42_jack_unsol_event(cs42l83))
-+		mbp131_jack_report(codec);
++	scoped_guard(mutex, &spec->jack_lock)
++		mbp131_jack_event(codec, res);
++
++	if (active > 0)
++		pm_runtime_put_autosuspend(dev);
 +}
 +
 +/*
@@ -752,11 +781,12 @@ index ce02fcd9f..9e3757e00 100644
 + * line stays low and makes no further edge. So look at the line itself once
 + * the responses get through.
 + */
-+static void mbp131_irq_sync_worker(struct work_struct *work)
++static void mbp131_irq_sync(struct hda_codec *codec)
 +{
-+	struct cs8409_spec *spec = container_of(work, struct cs8409_spec, irq_sync_work.work);
-+	struct hda_codec *codec = spec->codec;
++	struct cs8409_spec *spec = codec->spec;
++	struct device *dev = hda_codec_dev(codec);
 +	unsigned int gpio;
++	int active;
 +
 +	if (!codec->core.registered ||
 +	    codec->core.dev.power.power_state.event != PM_EVENT_ON) {
@@ -764,8 +794,27 @@ index ce02fcd9f..9e3757e00 100644
 +		return;
 +	}
 +
-+	gpio = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
-+	mbp131_jack_unsol_event(codec, gpio);
++	/*
++	 * Not snd_hda_power_up(): the suspend waits for this work to end.
++	 * Negative means no runtime PM; zero, not active: once more if the
++	 * codec is on its way up or down, nothing to do if it is suspended.
++	 */
++	active = pm_runtime_get_if_active(dev);
++	if (!active) {
++		if (!pm_runtime_suspended(dev))
++			mod_delayed_work(system_dfl_wq, &spec->irq_sync_work,
++					 msecs_to_jiffies(100));
++		return;
++	}
++
++	/* the level read under the lock: a handler ahead of us has cleared it */
++	scoped_guard(mutex, &spec->jack_lock) {
++		gpio = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
++		mbp131_jack_event(codec, gpio);
++	}
++
++	if (active > 0)
++		pm_runtime_put_autosuspend(dev);
 +}
 +
 +static int mbp131_exec_verb(struct hdac_device *dev, unsigned int cmd, unsigned int flags,
@@ -800,58 +849,148 @@ index ce02fcd9f..9e3757e00 100644
 +}
 +
 +/*
++ * Runtime suspend with nothing but the CS42L83 to notice a plug: the chip
++ * stays out of reset, silent and powered down, on its own oscillator because
++ * the bit clock stops. Its tip sense interrupt stays unmasked and comes through
++ * as an unsolicited response of the CS8409; the handler asks for a resume, and
++ * the resume looks at the tip sense status.
++ */
++static void mbp131_cs42l83_standby(struct sub_codec *cs42l83)
++{
++	static const struct cs8409_i2c_param standby_seq[] = {
++		{ CS42L42_MIXER_CHA_VOL, 0x3F },
++		{ CS42L42_MIXER_ADC_VOL, 0x3F },
++		{ CS42L42_MIXER_CHB_VOL, 0x3F },
++		{ CS42L42_HP_CTL, 0x0D },
++		{ CS42L42_ASP_RX_DAI0_EN, 0x00 },
++		{ CS42L42_OSC_SWITCH, 0x00 },
++		{ CS42L42_PWR_CTL1, 0xFE },
++	};
++
++	cs8409_i2c_bulk_write(cs42l83, standby_seq, ARRAY_SIZE(standby_seq));
++
++	/* the jack state stays: the chip is alive and reports any change */
++	cs42l83->suspended = 1;
++	cs42l83->last_page = 0;
++}
++
++/*
 + * Out of standby nothing was lost: the CS8409 kept its registers in D3 and the
 + * CS42L83 was never reset. Undo what the standby did and compare the tip sense
-+ * with what was known before. Starting from reset each time would mean a new
-+ * type detection under every stream that starts from idle: speakers on until
-+ * it is done, and the headset switches moved around while the stream plays.
++ * status with what was known before. Starting from reset each time would mean
++ * a new type detection under every stream that starts from idle: speakers on
++ * until it is done, and the headset switches moved around while the stream
++ * plays.
 + */
 +static void mbp131_standby_exit(struct hda_codec *codec)
 +{
 +	struct cs8409_spec *spec = codec->spec;
 +	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
 +	unsigned int fsv;
-+	int latched, n;
-+	bool tip;
++	int ts;
 +
 +	cs42l83->suspended = 0;
 +	spec->scodec_clk_on = 0;
 +
-+	/* from the standby interrupt back to the one used while running */
-+	cs8409_i2c_write(cs42l83, CS42L42_DET_INT1_MASK, 0xFF);
-+	latched = cs8409_i2c_read(cs42l83, CS42L83_DET_INT_STATUS1);
-+	tip = cs8409_i2c_read(cs42l83, CS42L42_DET_STATUS1) & CS42L42_TIP_SENSE_MASK;
-+
-+	/*
-+	 * The interrupt comes ahead of the debounced level: woken by an
-+	 * unplug, the level reads plugged for about half a second more. When
-+	 * the latched status reports a change the level does not show yet,
-+	 * give the level time to follow.
-+	 */
-+	if (latched > 0 &&
-+	    ((cs42l83->hp_jack_in && tip && (latched & CS42L42_TIP_SENSE_UNPLUG_MASK)) ||
-+	     (!cs42l83->hp_jack_in && !tip && (latched & CS42L42_TIP_SENSE_PLUG_MASK)))) {
-+		for (n = 0; n < 75 && tip == !!cs42l83->hp_jack_in; n++) {
-+			msleep(20);
-+			tip = cs8409_i2c_read(cs42l83, CS42L42_DET_STATUS1) &
-+			      CS42L42_TIP_SENSE_MASK;
-+		}
-+	}
-+
-+	fsv = cs8409_i2c_read(cs42l83, CS42L42_HP_CTL);
++	/* the standby wrote 0x0D: analog mutes off again, as cs42l42_resume() does */
++	fsv = 0x0D & ~CS42L42_ANA_MUTE_AB;
 +	if (cs42l83->full_scale_vol)
 +		fsv |= CS42L42_FULL_SCALE_VOL_MASK;
-+	cs8409_i2c_write(cs42l83, CS42L42_HP_CTL, fsv & ~CS42L42_ANA_MUTE_AB);
++	cs8409_i2c_write(cs42l83, CS42L42_HP_CTL, fsv);
 +
++	mbp131_amps_suspended(false);
 +	cs42l42_enable_jack_detect(cs42l83);
++	cs8409_enable_ur(codec, 1);
 +
-+	if (tip && !cs42l83->hp_jack_in) {
-+		cs42l42_run_jack_detect(cs42l83);
-+	} else if (!tip && cs42l83->hp_jack_in) {
++	/*
++	 * What woke the codec, if it was the jack; read with the interrupt
++	 * enabled again, so that nothing falls between the two. An unplug
++	 * shows at once. A plug shows only after the rise debounce: until then
++	 * the status reads as in transition, and the interrupt for the plug
++	 * is still to come.
++	 */
++	ts = cs8409_i2c_read(cs42l83, CS42L42_TSRS_PLUG_STATUS);
++	if (ts < 0)
++		return;
++	ts = (ts & (CS42L42_TS_PLUG_MASK | CS42L42_TS_UNPLUG_MASK)) >> CS42L42_TS_PLUG_SHIFT;
++
++	if (ts != CS42L42_TS_PLUG && cs42l83->hp_jack_in) {
++		/* out, or out and on its way in again: what was in is gone */
 +		cs42l83->hp_jack_in = 0;
 +		cs42l83->mic_jack_in = 0;
 +		mbp131_jack_report(codec);
++	} else if (ts == CS42L42_TS_PLUG && !cs42l83->hp_jack_in) {
++		cs42l42_run_jack_detect(cs42l83);
 +	}
++}
++
++/*
++ * A runtime suspend goes to standby; a system sleep, with the codec in use,
++ * takes the CS42L83 down for good. power_state is ON for a runtime suspend and
++ * something else around a system sleep; after a system suspend aborted before
++ * this callback ran it stays at RESUME until the next resume, and a runtime
++ * suspend in between takes the system branch, which the full init then mends.
++ * A shutdown comes here as a runtime suspend and leaves the chip in standby.
++ */
++static int mbp131_suspend(struct hda_codec *codec)
++{
++	struct cs8409_spec *spec = codec->spec;
++	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
++	bool standby = codec->core.dev.power.power_state.event == PM_EVENT_ON;
++
++	spec->init_done = 0;
++
++	cancel_delayed_work_sync(&spec->irq_sync_work);
++
++	/* no cleanup hook has run if a stream was up */
++	mbp131_cs42l83_clk_stop(cs42l83);
++	mbp131_amps_power(false);
++	mbp131_amps_suspended(true);
++
++	if (standby) {
++		mbp131_cs42l83_standby(cs42l83);
++	} else {
++		/*
++		 * A forced suspend does not honour the reference of a jack
++		 * handler in flight: let that one finish first.
++		 */
++		guard(mutex)(&spec->jack_lock);
++
++		spec->playback_started = 0;
++		spec->capture_started = 0;
++		cs8409_enable_ur(codec, 0);
++		cs42l42_suspend(cs42l83);
++	}
++
++	cs8409_suspend_i2c(codec);
++
++	snd_hda_shutup_pins(codec);
++
++	return 0;
++}
++
++/* GPIO setup, reset line and one slot of mbp131_hw_cfg still as they were left */
++static bool mbp131_standby_intact(struct hda_codec *codec)
++{
++	struct cs8409_spec *spec = codec->spec;
++	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
++	const struct cs8409_cir_param *seq;
++
++	if (snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_MASK, 0) !=
++	    spec->gpio_mask)
++		return false;
++	if (!(snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0) &
++	      cs42l83->reset_gpio))
++		return false;
++
++	/* and one coefficient of the table, picked for not being a default */
++	for (seq = mbp131_hw_cfg; seq->nid; seq++)
++		if (seq->cir == ASP2_A_TX_CTRL1)
++			break;
++
++	guard(mutex)(&spec->i2c_mux);
++
++	return seq->nid && cs8409_vendor_coef_get(codec, seq->cir) == seq->coeff;
 +}
 +
 +/* Returns false when the light way out of standby was enough */
@@ -863,14 +1002,14 @@ index ce02fcd9f..9e3757e00 100644
 +	unsigned int cir;
 +
 +	/*
-+	 * After S3 the CS8409 is at its power-on defaults, GPIO mask zero;
-+	 * after a system suspend the CS42L83 is held in reset.
++	 * The light way only for a runtime resume, power_state ON, that finds
++	 * the CS8409 as the standby left it. After any system sleep the full
++	 * init: S3 leaves the CS8409 at its power-on defaults, and what a link
++	 * reset without a power loss or the firmware leave behind is not known.
 +	 */
 +	if (spec->full_init_done &&
-+	    snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_MASK, 0) ==
-+	    spec->gpio_mask &&
-+	    (snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0) &
-+	     cs42l83->reset_gpio)) {
++	    codec->core.dev.power.power_state.event == PM_EVENT_ON &&
++	    mbp131_standby_intact(codec)) {
 +		mbp131_standby_exit(codec);
 +		return false;
 +	}
@@ -889,7 +1028,10 @@ index ce02fcd9f..9e3757e00 100644
 +		snd_hda_codec_set_gpio(codec, spec->gpio_mask, spec->gpio_dir,
 +				       spec->gpio_data, 0);
 +
-+	/* Every slot off first: after a power loss they are not */
++	/*
++	 * Every slot off first: after a power loss they are not. The last
++	 * register, ASP2_H_RX_CTRL2, is left out as AppleHDA leaves it out.
++	 */
 +	for (cir = ASP1_A_TX_CTRL1; cir <= ASP2_H_RX_CTRL1; cir++)
 +		cs8409_vendor_coef_set(codec, cir, 0x8000);
 +
@@ -897,8 +1039,9 @@ index ce02fcd9f..9e3757e00 100644
 +		cs8409_vendor_coef_set(codec, seq->cir, seq->coeff);
 +
 +	spec->scodec_clk_on = 0;
++	cs42l83->last_page = 0;
 +	cs42l42_resume(cs42l83);
-+	mbp131_amps_init(codec);
++	mbp131_amps_init();
 +
 +	/* Enable Unsolicited Response */
 +	cs8409_enable_ur(codec, 1);
@@ -933,7 +1076,8 @@ index ce02fcd9f..9e3757e00 100644
 +		spec->gen.no_primary_hp = 1;
 +		spec->gen.suppress_vmaster = 1;
 +		spec->unsol_event = mbp131_jack_unsol_event;
-+		INIT_DELAYED_WORK(&spec->irq_sync_work, mbp131_irq_sync_worker);
++		spec->suspend = mbp131_suspend;
++		spec->irq_sync = mbp131_irq_sync;
 +		spec->speaker_vol[0] = MBP131_SPK_VOL_MAX;
 +		spec->speaker_vol[1] = MBP131_SPK_VOL_MAX;
 +
@@ -955,6 +1099,11 @@ index ce02fcd9f..9e3757e00 100644
 +		/* Fix Sample Rate to 44.1kHz */
 +		spec->gen.stream_analog_playback = &mbp131_44k_pcm_analog_playback;
 +		spec->gen.stream_analog_capture = &mbp131_44k_pcm_analog_capture;
++		/*
++		 * Two speaker pins, but one stereo pair: the second converter
++		 * gets a copy of the first, never channels of its own.
++		 */
++		spec->gen.multiout.max_channels = 2;
 +		/* add hooks */
 +		spec->gen.pcm_playback_hook = mbp131_playback_pcm_hook;
 +		spec->gen.pcm_capture_hook = mbp131_capture_pcm_hook;
@@ -1003,8 +1152,9 @@ index ce02fcd9f..9e3757e00 100644
 +}
 +
 +/*
-+ * Boards whose codec subsystem ID cannot be relied on: the firmware writes it
-+ * at boot and a link reset puts the CS8409's own ID back.
++ * Boards whose codec subsystem ID cannot be relied on: the one the firmware
++ * writes at boot is not there after the controller has been probed again, and
++ * the CS8409 reports its own.
 + */
 +static const struct dmi_system_id cs8409_dmi_fixup_tbl[] = {
 +	{
@@ -1037,7 +1187,7 @@ index ce02fcd9f..9e3757e00 100644
  static int cs8409_probe(struct hda_codec *codec, const struct hda_device_id *id)
  {
  	int err;
-@@ -1599,6 +2260,7 @@ static int cs8409_probe(struct hda_codec *codec, const struct hda_device_id *id)
+@@ -1627,6 +2400,7 @@ static int cs8409_probe(struct hda_codec *codec, const struct hda_device_id *id)
  		return -ENOMEM;
  
  	snd_hda_pick_fixup(codec, cs8409_models, cs8409_fixup_tbl, cs8409_fixups);
@@ -1046,7 +1196,7 @@ index ce02fcd9f..9e3757e00 100644
  	codec_dbg(codec, "Picked ID=%d, VID=%08x, DEV=%08x\n", codec->fixup_id,
  			 codec->bus->pci->subsystem_vendor,
 diff --git a/sound/hda/codecs/cirrus/cs8409.h b/sound/hda/codecs/cirrus/cs8409.h
-index be1714a84..6aad14552 100644
+index 709baaca8..fd0e4cf0e 100644
 --- a/sound/hda/codecs/cirrus/cs8409.h
 +++ b/sound/hda/codecs/cirrus/cs8409.h
 @@ -274,6 +274,8 @@ enum {
@@ -1058,7 +1208,7 @@ index be1714a84..6aad14552 100644
  };
  
  enum {
-@@ -339,12 +341,17 @@ struct cs8409_spec {
+@@ -341,18 +343,29 @@ struct cs8409_spec {
  	unsigned int i2c_clck_enabled;
  	unsigned int dev_addr;
  	struct delayed_work i2c_clk_work;
@@ -1073,18 +1223,32 @@ index be1714a84..6aad14552 100644
 +	unsigned int scodec_clk_on:1;
 +	unsigned int full_init_done:1;
 +	unsigned int speaker_vol[2];
++	/* MacBookPro13,1: the jack handler against the PCM hooks */
++	struct mutex jack_lock;
  
  	/* verb exec op override */
  	int (*exec_verb)(struct hdac_device *dev, unsigned int cmd, unsigned int flags,
-@@ -383,6 +390,45 @@ void cs8409_cs42l42_fixups(struct hda_codec *codec, const struct hda_fixup *fix,
+ 			 unsigned int *res);
+ 	/* unsol_event op override */
+ 	void (*unsol_event)(struct hda_codec *codec, unsigned int res);
++	/* suspend op override */
++	int (*suspend)(struct hda_codec *codec);
++	/* run from irq_sync_work, for a board that schedules it */
++	void (*irq_sync)(struct hda_codec *codec);
+ 
+ 	/* component binding */
+ 	struct component_match *match;
+@@ -385,8 +398,45 @@ void cs8409_cs42l42_fixups(struct hda_codec *codec, const struct hda_fixup *fix,
  void dolphin_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int action);
  
  extern const struct cs8409_cir_param cs8409_cdb35l56_four_hw_cfg[];
 +
+ extern const struct hda_verb cs8409_cdb35l56_four_init_verbs[];
+ void cs8409_cdb35l56_four_autodet_fixup(struct hda_codec *codec, const struct hda_fixup *fix,
+ 					int action);
+ 
 +/* Apple MacBookPro13,1: CS8409 with a CS42L83 and four SSM3515 speaker amps */
 +#define MBP131_NUM_AMPS			4
-+/* Where the CS42L83 keeps the status that goes with CS42L42_DET_INT1_MASK */
-+#define CS42L83_DET_INT_STATUS1		(CS42L42_PAGE_1B + 0x7B)
 +#define MBP131_CS42L83_INT		BIT(0)
 +#define MBP131_CS42L83_RESET		BIT(1)
 +
@@ -1093,7 +1257,6 @@ index be1714a84..6aad14552 100644
 +#define MBP131_SPK_B_PIN_NID		CS8409_PIN_ASP1_TRANSMITTER_B
 +#define MBP131_HP_PIN_NID		CS8409_PIN_ASP2_TRANSMITTER_A
 +#define MBP131_AMIC_PIN_NID		CS8409_PIN_ASP2_RECEIVER_A
-+#define MBP131_DMIC_PIN_NID		CS8409_PIN_DMIC1_IN
 +#define MBP131_DMIC_ADC_PIN_NID		CS8409_PIN_DMIC1
 +
 +#define SSM3515_I2C_ADDR(n)		((0x14 + (n)) << 1)
@@ -1119,9 +1282,8 @@ index be1714a84..6aad14552 100644
 +extern const struct cs8409_i2c_param mbp131_ssm3515_init_reg_seq[];
 +extern const unsigned int mbp131_ssm3515_init_reg_seq_num;
 +void mbp131_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int action);
- extern const struct hda_verb cs8409_cdb35l56_four_init_verbs[];
- void cs8409_cdb35l56_four_autodet_fixup(struct hda_codec *codec, const struct hda_fixup *fix,
- 					int action);
++
+ #endif
 -- 
 2.55.0
 

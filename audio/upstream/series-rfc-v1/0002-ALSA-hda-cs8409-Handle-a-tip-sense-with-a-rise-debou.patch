@@ -1,0 +1,88 @@
+From 6ba1142e885d8a1033d4472be945ace2d546de70 Mon Sep 17 00:00:00 2001
+From: Michal Szpakowski <michi.szpakowski@gmail.com>
+Date: Sun, 4 Oct 2026 20:09:01 +0200
+Subject: [RFC PATCH 2/3] ALSA: hda/cs8409: Handle a tip sense with a rise
+ debounce
+
+cs42l42_handle_tip_sense() starts the headset type detection on every
+"plugged" tip sense status. When TSENSE_CTL sets a rise debounce, a plug
+that is in at the init is detected by the detection run from the init,
+and its debounced "plugged" status arrives afterwards: the detection
+then runs a second time, moving the headset switches again, possibly
+under a stream that has started in between.
+
+The boards supported so far set no rise debounce, so the status has
+settled by the time the interrupt is unmasked. The next patch adds a
+board with a 1 s debounce; there the second detection was seen about
+half a second after every init with a headset in.
+
+Add a sub-codec flag, ts_rise_dbnc, for such a board. With it set, a
+"plugged" status for a jack already known to be in does not start the
+detection again. Since that makes the known state stick until an unplug
+is seen, and the tip sense is masked while the detection runs, the tip
+sense status is read once more after the detection has unmasked it: a
+jack pulled in that time is not taken for in.
+
+No change for the existing boards, which do not set the flag.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ sound/hda/codecs/cirrus/cs8409.c | 21 +++++++++++++++++++++
+ sound/hda/codecs/cirrus/cs8409.h |  2 ++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/sound/hda/codecs/cirrus/cs8409.c b/sound/hda/codecs/cirrus/cs8409.c
+index 998e821f7..2461e0a68 100644
+--- a/sound/hda/codecs/cirrus/cs8409.c
++++ b/sound/hda/codecs/cirrus/cs8409.c
+@@ -766,6 +766,12 @@ static int cs42l42_handle_tip_sense(struct sub_codec *cs42l42, unsigned int reg_
+ 	/* TIP_SENSE INSERT/REMOVE */
+ 	switch (reg_ts_status) {
+ 	case CS42L42_TS_PLUG:
++		/*
++		 * With a rise debounce the status of a plug that was in at the
++		 * init gets here after the detection run from the init.
++		 */
++		if (cs42l42->ts_rise_dbnc && cs42l42->hp_jack_in)
++			break;
+ 		if (cs42l42->no_type_dect) {
+ 			status_changed = 1;
+ 			cs42l42->hp_jack_in = 1;
+@@ -857,6 +863,21 @@ static int cs42l42_jack_unsol_event(struct sub_codec *cs42l42)
+ 		cs8409_i2c_write(cs42l42, CS42L42_DAC_CTL2, 0x02);
+ 		/* Re-Enable Tip Sense Interrupt */
+ 		cs8409_i2c_write(cs42l42, CS42L42_TSRS_PLUG_INT_MASK, 0xF3);
++
++		/*
++		 * The tip sense was masked while the detection ran. A board
++		 * that will not detect again a jack it believes in must not
++		 * believe in one pulled meanwhile: look once more, now that
++		 * the interrupt is back.
++		 */
++		if (cs42l42->ts_rise_dbnc && cs42l42->hp_jack_in) {
++			reg_ts_status = cs8409_i2c_read(cs42l42, CS42L42_TSRS_PLUG_STATUS);
++			if (reg_ts_status >= 0 &&
++			    !(reg_ts_status & (CS42L42_TS_PLUG_MASK | CS42L42_TS_UNPLUG_MASK))) {
++				cs42l42->hp_jack_in = 0;
++				cs42l42->mic_jack_in = 0;
++			}
++		}
+ 	} else {
+ 		status_changed = cs42l42_handle_tip_sense(cs42l42, current_plug_status);
+ 	}
+diff --git a/sound/hda/codecs/cirrus/cs8409.h b/sound/hda/codecs/cirrus/cs8409.h
+index be1714a84..709baaca8 100644
+--- a/sound/hda/codecs/cirrus/cs8409.h
++++ b/sound/hda/codecs/cirrus/cs8409.h
+@@ -318,6 +318,8 @@ struct sub_codec {
+ 	unsigned int hsbias_hiz;
+ 	unsigned int full_scale_vol:1;
+ 	unsigned int no_type_dect:1;
++	/* TSENSE_CTL sets a rise debounce: "plugged" comes late */
++	unsigned int ts_rise_dbnc:1;
+ 
+ 	s8 vol[CS42L42_VOLUMES];
+ };
+-- 
+2.55.0
+
